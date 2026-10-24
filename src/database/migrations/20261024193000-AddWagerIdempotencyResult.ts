@@ -50,6 +50,21 @@ export class AddWagerIdempotencyResult20261024193000
   }
 
   async down(queryRunner: QueryRunner): Promise<void> {
+    const externalTerminalRows = (await queryRunner.query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM wager_transactions
+         WHERE kind <> 'OPENING'
+           AND status IN ('PROCESSED', 'REJECTED', 'FAILED')
+       ) AS "hasExternalTerminalTransactions"`,
+    )) as Array<{ hasExternalTerminalTransactions: boolean }>;
+
+    if (externalTerminalRows[0]?.hasExternalTerminalTransactions) {
+      throw new Error(
+        "Cannot revert AddWagerIdempotencyResult: external terminal transactions exist and require their result snapshots for idempotent replay. Retain this migration; rollback requires a separately verified snapshot archival strategy.",
+      );
+    }
+
     await queryRunner.dropCheckConstraint(
       "wager_transactions",
       "ck_wager_transactions_terminal_result_snapshot",

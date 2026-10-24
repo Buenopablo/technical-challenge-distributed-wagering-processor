@@ -34,6 +34,41 @@ function getBaseUrl(): string {
   return baseUrl;
 }
 
+async function startIndependentWagerApp(
+  database: string,
+): Promise<{
+  app: Awaited<ReturnType<typeof NestFactory.create>>;
+  baseUrl: string;
+}> {
+  const options = createDatabaseOptions();
+  if (options.type !== "postgres") {
+    throw new Error("Integration tests require PostgreSQL");
+  }
+
+  class IndependentWagerApiIntegrationModule {}
+  Module({
+    imports: [
+      TypeOrmModule.forRoot({
+        ...options,
+        database,
+      }),
+    ],
+    controllers: [WagerTransactionsController],
+    providers: [ProcessWagerTransactionUseCase],
+  })(IndependentWagerApiIntegrationModule);
+
+  const independentApp = await NestFactory.create(
+    IndependentWagerApiIntegrationModule,
+    { logger: false },
+  );
+  await independentApp.listen(0, "127.0.0.1");
+  const address = independentApp.getHttpServer().address() as AddressInfo;
+  return {
+    app: independentApp,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  };
+}
+
 async function createWallet(balance: string) {
   return new OpenWalletUseCase(getTestDataSource()).execute({
     playerId: randomUUID(),
@@ -63,6 +98,21 @@ function submit(
   body: object,
 ): Promise<Response> {
   return fetch(`${getBaseUrl()}/wagering/transactions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function submitTo(
+  url: string,
+  idempotencyKey: string,
+  body: object,
+): Promise<Response> {
+  return fetch(`${url}/wagering/transactions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -247,6 +297,46 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     });
   });
 
+  test("persists player mismatch rejection without changing wallet or ledger", async () => {
+    const wallet = await createWallet("100.00");
+    const body = {
+      ...requestBody(wallet, WagerTransactionKind.Win, "10.00"),
+      playerId: randomUUID(),
+    };
+    const response = await submit("provider-a:player-mismatch", body);
+    expect(response.status).toBe(422);
+    const result = await responseBody(response);
+    expect(result).toMatchObject({
+      status: "REJECTED",
+      balance: { amount: "100.00", currency: "BRL" },
+      idempotentReplay: false,
+      failureCode: "WALLET_PLAYER_MISMATCH",
+    });
+
+    const [transaction] = await getTestDataSource().query(
+      `SELECT status, failure_code, result_balance, result_currency
+       FROM wager_transactions WHERE id = $1`,
+      [result.transactionId],
+    );
+    expect(transaction).toEqual({
+      status: "REJECTED",
+      failure_code: "WALLET_PLAYER_MISMATCH",
+      result_balance: "100.00",
+      result_currency: "BRL",
+    });
+
+    const [persistedWallet] = await getTestDataSource().query(
+      "SELECT balance FROM wallets WHERE id = $1",
+      [wallet.id],
+    );
+    expect(persistedWallet.balance).toBe("100.00");
+    const [ledgerCount] = await getTestDataSource().query(
+      "SELECT count(*)::int AS count FROM wallet_ledger_entries WHERE transaction_id = $1",
+      [result.transactionId],
+    );
+    expect(ledgerCount.count).toBe(0);
+  });
+
   test("persists insufficient-funds rejection without partial balance changes", async () => {
     const wallet = await createWallet("100.00");
     const response = await submit(
@@ -354,8 +444,27 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     const refund = await submit("provider-a:deferred-refund", {
       ...body,
       kind: "REFUND",
+      referenceExternalTransactionId: "provider-a:original-bet",
     });
     expect(refund.status).toBe(501);
+    const rollback = await submit("provider-a:deferred-rollback", {
+      ...body,
+      kind: "ROLLBACK",
+      referenceExternalTransactionId: "provider-a:original-win",
+    });
+    expect(rollback.status).toBe(501);
+    const malformedRefund = await submit("provider-a:malformed-refund", {
+      ...body,
+      kind: "REFUND",
+      referenceExternalTransactionId: "provider-a:original-bet",
+      money: { amount: "1e2", currency: "BRL" },
+    });
+    expect(malformedRefund.status).toBe(400);
+    const missingRollbackReference = await submit(
+      "provider-a:missing-rollback-reference",
+      { ...body, kind: "ROLLBACK" },
+    );
+    expect(missingRollbackReference.status).toBe(400);
     expect(await countByValue("wager_transactions", "kind", "BET", wallet.id)).toBe(0);
   });
 
@@ -446,6 +555,62 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       [wallet.id],
     );
     expect(persistedWallet.balance).toBe("920.00");
+  });
+
+  test("serializes same-wallet bets across three independent application instances", async () => {
+    const wallet = await createWallet("100.00");
+    const instances = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        startIndependentWagerApp(testDatabaseName as string),
+      ),
+    );
+
+    try {
+      const responses = await Promise.all(
+        instances.map((instance, index) =>
+          submitTo(
+            instance.baseUrl,
+            `provider-a:multi-instance-bet-${index}`,
+            requestBody(wallet, WagerTransactionKind.Bet, "80.00"),
+          ),
+        ),
+      );
+      expect(responses.map((response) => response.status).sort()).toEqual([
+        200, 422, 422,
+      ]);
+
+      const [persistedWallet] = await getTestDataSource().query(
+        "SELECT balance FROM wallets WHERE id = $1",
+        [wallet.id],
+      );
+      expect(persistedWallet.balance).toBe("20.00");
+      expect(
+        await countByValue(
+          "wallet_ledger_entries",
+          "direction",
+          "DEBIT",
+          wallet.id,
+        ),
+      ).toBe(1);
+      expect(
+        await countByValue(
+          "wager_transactions",
+          "kind",
+          WagerTransactionKind.Bet,
+          wallet.id,
+        ),
+      ).toBe(3);
+      const [transactionCounts] = await getTestDataSource().query(
+        `SELECT count(*) FILTER (WHERE status = 'PROCESSED')::int AS processed,
+                count(*) FILTER (WHERE status = 'REJECTED')::int AS rejected
+         FROM wager_transactions
+         WHERE wallet_id = $1 AND kind = 'BET'`,
+        [wallet.id],
+      );
+      expect(transactionCounts).toEqual({ processed: 1, rejected: 2 });
+    } finally {
+      await Promise.all(instances.map((instance) => instance.app.close()));
+    }
   });
 
   test("rolls back the idempotency record and wallet change on unexpected ledger failure", async () => {

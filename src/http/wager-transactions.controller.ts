@@ -23,6 +23,18 @@ import {
   WagerTransactionKind,
   WagerTransactionStatus,
 } from "../domain/wager-transaction/wager-transaction";
+import { Money } from "../domain/money/money";
+
+function validateMoney(amount: string, currency: string): void {
+  try {
+    Money.from({ amount, currency });
+  } catch (error) {
+    if (error instanceof MoneyValidationError) {
+      throw new BadRequestException(error.message);
+    }
+    throw error;
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -97,10 +109,13 @@ function parseRequest(
   if (typeof amount !== "string" || typeof currency !== "string") {
     throw new BadRequestException("money.amount and money.currency must be strings");
   }
+  validateMoney(amount, currency);
+
   if (
     kind === WagerTransactionKind.Refund ||
     kind === WagerTransactionKind.Rollback
   ) {
+    requiredString(body, "referenceExternalTransactionId", 255);
     throw new NotImplementedException(
       `${kind} is part of the challenge contract but is not implemented yet`,
     );

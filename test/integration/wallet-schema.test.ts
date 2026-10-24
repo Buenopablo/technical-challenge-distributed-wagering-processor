@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DataSource } from "typeorm";
 import { OpenWalletUseCase } from "../../src/application/wallets/open-wallet.use-case";
+import { ProcessWagerTransactionUseCase } from "../../src/application/wagering/process-wager-transaction.use-case";
 import { createDatabaseOptions } from "../../src/database/data-source";
+import { WagerTransactionKind } from "../../src/domain/wager-transaction/wager-transaction";
 
 let testDataSource: DataSource | undefined;
 let adminDataSource: DataSource | undefined;
@@ -312,5 +314,40 @@ describe("wallet opening persistence in PostgreSQL", () => {
       transactions: "wager_transactions",
       ledger: "wallet_ledger_entries",
     });
+  });
+
+  test("refuses to revert idempotency snapshots needed by terminal transactions", async () => {
+    const wallet = await createOpenWalletUseCase().execute({
+      playerId: randomUUID(),
+      initialBalance: { amount: "100.00", currency: "BRL" },
+    });
+    const idempotencyKey = `migration-snapshot:${randomUUID()}`;
+    await new ProcessWagerTransactionUseCase(getTestDataSource()).execute({
+      idempotencyKey,
+      providerId: "migration-test",
+      externalTransactionId: randomUUID(),
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: "migration-test-round",
+      gameId: "migration-test-game",
+      kind: WagerTransactionKind.Bet,
+      money: { amount: "10.00", currency: "BRL" },
+    });
+
+    await expect(getTestDataSource().undoLastMigration()).rejects.toThrow(
+      /external terminal transactions exist and require their result snapshots/,
+    );
+
+    const [snapshot] = await getTestDataSource().query(
+      `SELECT result_balance, result_currency
+       FROM wager_transactions
+       WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    expect(snapshot).toEqual({
+      result_balance: "90.00",
+      result_currency: "BRL",
+    });
+    expect(await getTestDataSource().runMigrations()).toEqual([]);
   });
 });

@@ -50,6 +50,13 @@ compartilhado pela aplicação e pelos comandos de migration mantém
 `synchronize` e execução automática de migrations desativados; o schema é
 alterado explicitamente pelas migrations versionadas.
 
+A migration de snapshots de idempotência recusa a reversão enquanto houver
+transações externas em estado terminal (`PROCESSED`, `REJECTED` ou `FAILED`),
+pois removeria os saldos originais necessários para responder a replays. Nesse
+caso, a migration não faz alterações. Uma reversão exige uma estratégia de
+arquivamento dos snapshots verificada separadamente; não se deve contornar a
+proteção apagando transações.
+
 ## Verificações e execução
 
 Os scripts abaixo estão definidos em `package.json`:
@@ -155,11 +162,11 @@ Comportamentos HTTP implementados:
 | HTTP | Situação |
 | --- | --- |
 | `200` | Processamento bem-sucedido ou replay de operação processada. |
-| `400` | Header ausente, payload inválido, moeda/valor inválido ou tentativa de enviar `OPENING`. |
+| `400` | Header ausente, payload inválido, moeda/valor inválido, campos obrigatórios de referência ausentes ou tentativa de enviar `OPENING`. |
 | `404` | Carteira inexistente. |
 | `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente. |
 | `422` | Rejeição de negócio. O corpo inclui `transactionId`, `status`, `balance`, `idempotentReplay` e `failureCode`. |
-| `501` | `REFUND` ou `ROLLBACK`, reconhecidos pelo desafio, mas ainda não implementados nesta etapa. |
+| `501` | Payload válido de `REFUND` ou `ROLLBACK`, reconhecido pelo desafio, mas ainda não implementado nesta etapa. Essas operações exigem `referenceExternalTransactionId`; payload malformado retorna `400`. |
 | `500` | Falha inesperada de infraestrutura; a transação SQL é revertida. |
 
 O README oficial deixa o mapeamento HTTP a cargo do candidato. Para `409`,
@@ -181,3 +188,8 @@ resultado; falhas inesperadas não deixam uma transação parcial persistida.
 Os próximos passos devem seguir o escopo oficial do desafio e acrescentar
 essas capacidades com testes de integração, sem tratar esta fundação como uma
 solução concluída.
+
+Os testes de integração de concorrência incluem três instâncias NestJS
+independentes, cada uma com seu próprio servidor HTTP e pool PostgreSQL,
+compartilhando apenas o banco temporário de teste. Isso exercita o lock no
+banco entre instâncias, sem depender de coordenação em memória.

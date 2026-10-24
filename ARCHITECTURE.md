@@ -191,7 +191,13 @@ As migrations atuais:
 
 As migrations têm operações `up` e `down`. `bun run db:revert` reverte uma
 migration por execução; reverter todo o schema atual requer uma execução para
-cada migration aplicada, na ordem inversa.
+cada migration aplicada, na ordem inversa. Há uma limitação intencional: o
+`down()` da migration de snapshots verifica primeiro a existência de
+transações externas terminais (`PROCESSED`, `REJECTED` ou `FAILED`) e falha
+antes de qualquer operação destrutiva se encontrar alguma. Sem esses snapshots
+não é possível reproduzir com segurança as respostas originais em replays.
+Para reverter após operações financeiras, é necessária uma estratégia separada
+e verificada de arquivamento; os snapshots não são descartados silenciosamente.
 
 ## Decisões e trade-offs
 
@@ -222,7 +228,10 @@ cada migration aplicada, na ordem inversa.
   rejeição e seu replay; `409` para conflito de chave; `400` para entrada
   inválida; `404` para wallet
   inexistente; `501` para `REFUND`/`ROLLBACK` ainda não implementados; `500`
-  para falhas inesperadas, após rollback.
+  para falhas inesperadas, após rollback. O controller valida os campos
+  obrigatórios, `referenceExternalTransactionId` e o formato de `Money` antes
+  de responder `501` para um `REFUND`/`ROLLBACK` válido; payload malformado
+  permanece `400`.
 - **Autenticação:** não está implementada. O desafio a considera opcional e
   sem pontos próprios. Se for adicionada, deve integrar um Identity Provider
   externo; o ponto de extensão será uma camada de autenticação/guard do NestJS,
@@ -235,10 +244,14 @@ migrations de wallet/OPENING/ledger e idempotência, `Money`, domínio de
 Wallet/`WagerTransaction`/ledger, casos de uso transacionais de abertura e
 processamento BET/WIN/LOSS, endpoint POST de transação, replay idempotente,
 bloqueio por carteira e testes unitários e de integração com PostgreSQL real.
+Os testes de concorrência também iniciam três instâncias NestJS independentes,
+com servidores e pools próprios, para verificar a serialização no PostgreSQL
+compartilhado. A migration de snapshots foi testada para recusar reversão
+quando há transações externas terminais e manter seus dados e sua aplicação.
 
 Ainda previsto: endpoint de abertura e endpoints de consulta; `REFUND` e
 `ROLLBACK`; referências pendentes; SQS, Inbox, Outbox, retries e DLQ;
 reconciliação, health checks, observabilidade e autenticação opcional. Os
-testes atuais não pretendem validar três ou mais processos de aplicação,
-mensageria nem recovery de workers. Cada componente deve ser implementado e
-validado antes de ser descrito como capacidade disponível.
+testes ainda não validam execução em três ou mais processos do sistema
+operacional, mensageria nem recovery de workers. Cada componente deve ser
+implementado e validado antes de ser descrito como capacidade disponível.
