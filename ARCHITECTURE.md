@@ -17,6 +17,9 @@ As responsabilidades estão organizadas em:
   abertura e processamento financeiro, que coordenam domínio e persistência.
 - `src/http/`: controller de `POST /wagering/transactions`, responsável pela
   validação de entrada e pelo mapeamento de erros para HTTP.
+- `src/messaging/contracts/`: contratos versionados e validação de mensagens
+  SQS de entrada e eventos de integração de saída; não contém ainda publisher,
+  consumidor, Inbox ou Outbox.
 - `src/database/entities/`: mapeamento das tabelas PostgreSQL para TypeORM.
 - `src/database/migrations/`: criação versionada e reversível do schema.
 - `src/database/data-source.ts`: opções compartilhadas pela aplicação e pelos
@@ -255,3 +258,57 @@ reconciliação, health checks, observabilidade e autenticação opcional. Os
 testes ainda não validam execução em três ou mais processos do sistema
 operacional, mensageria nem recovery de workers. Cada componente deve ser
 implementado e validado antes de ser descrito como capacidade disponível.
+
+## Preparação de SQS e contratos da etapa 4
+
+O README oficial determina AWS SQS via LocalStack ou MiniStack e pressupõe
+entrega `at-least-once`, reentrega, eventos duplicados e indisponibilidade
+temporária. Também define a estrutura conceitual de Inbox e Outbox e exige que
+Inbox, operação financeira, ledger e Outbox participem da mesma transação SQL.
+O enunciado não determina os nomes exatos das filas nem um envelope completo
+de entrada/saída; os nomes e esquemas abaixo são decisões desta implementação,
+não requisitos literais do README.
+
+O serviço LocalStack usa container próprio no Docker Compose e porta local
+`14566`, sem substituir nem compartilhar os recursos PostgreSQL do projeto.
+Os nomes vêm das variáveis `SQS_WAGER_TRANSACTIONS_QUEUE` e
+`SQS_WAGER_TRANSACTIONS_DLQ`, compartilhadas pelo serviço, script de
+provisionamento e healthcheck; os defaults são `wager-transactions.fifo` e
+`wager-transactions-dlq.fifo`. O provisionamento usa `create-queue` com os
+mesmos atributos, podendo ser repetido sem criar filas duplicadas. A fila de
+entrada tem redrive para a DLQ após cinco recebimentos sem confirmação. FIFO e
+deduplicação do broker serão otimizações de ordenação e tráfego, não a
+garantia de idempotência financeira.
+
+A mensagem de entrada proposta tem `messageVersion: 1`, `idempotencyKey` e
+`transaction`. O objeto de transação contém `providerId`,
+`externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`
+e `money`. A validação já implementada nesta subetapa aceita os tipos atuais
+`BET`, `WIN` e `LOSS`, valida identificadores e Money sem conversão monetária
+para `number`, e rejeita `OPENING`; `REFUND` e `ROLLBACK` ficam fora da etapa 4.
+O `messageId` de transporte virá dos atributos do SQS; não substitui a
+`idempotencyKey` de negócio.
+
+Os eventos de saída definidos para operações atuais compartilham um envelope
+com `eventId` criado uma vez e persistido com o evento na futura Outbox,
+`eventType`, `eventVersion: 1`, `occurredAt` ISO-8601 UTC com sufixo `Z` e
+precisão de até milissegundos, `aggregateId` (UUID da wallet), `payload` e
+`causationId`/`correlationId` opcionais.
+`WagerTransactionProcessed` inclui operações `LOSS`, `WagerTransactionRejected`
+carrega `failureCode`, e `WalletBalanceChanged` só é emitido se o saldo mudar.
+O primeiro tipo contém identificadores do wager, `kind`, `money` e
+`resultBalance`; o segundo contém os mesmos campos mais `failureCode`; o evento
+de saldo contém `transactionId`, `walletId`, `playerId`, `previousBalance` e
+`balance`. Money permanece serializado como string decimal. Os três eventos
+têm validadores runtime que verificam campos, UUIDs, timestamp UTC válido,
+moeda e coerência entre `aggregateId` e `walletId`; em rejeições, a moeda da
+operação pode diferir da moeda do snapshot da carteira, por exemplo em uma
+rejeição por incompatibilidade de moeda. Testes cobrem serialização e rejeição
+para cada tipo. A mensagem de entrada também tem validação runtime e testes.
+O mecanismo de geração/publicação, persistência Outbox e consumo ainda serão
+implementados nas subetapas seguintes.
+
+Não foi adicionada dependência AWS nesta preparação: o Compose provisiona o
+serviço local e os contratos são TypeScript/validados com o domínio existente.
+O AWS SDK para SQS será adicionado somente quando publisher ou consumidor
+forem implementados e sua necessidade confirmada.

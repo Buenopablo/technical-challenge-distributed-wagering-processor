@@ -20,6 +20,32 @@ services:
       timeout: 3s
       retries: 10
 
+  localstack:
+    image: localstack/localstack:4.0.3
+    container_name: jungle-wagering-foundation-localstack
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      SQS_WAGER_TRANSACTIONS_QUEUE: ${SQS_WAGER_TRANSACTIONS_QUEUE:-wager-transactions.fifo}
+      SQS_WAGER_TRANSACTIONS_DLQ: ${SQS_WAGER_TRANSACTIONS_DLQ:-wager-transactions-dlq.fifo}
+      EAGER_SERVICE_LOADING: "1"
+    ports:
+      - "127.0.0.1:14566:4566"
+    volumes:
+      - "./infra/localstack/init/ready.d:/etc/localstack/init/ready.d:ro"
+    networks:
+      - jungle-wagering-foundation-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_TRANSACTIONS_QUEUE}\" >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
 networks:
   jungle-wagering-foundation-network:
     name: jungle-wagering-foundation-network

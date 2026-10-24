@@ -15,6 +15,7 @@ Outbox, workers, retries, DLQ, reconciliação e observabilidade.
 - Bun 1.x (o `package.json` requer Bun `>=1.2.0`).
 - Docker Compose.
 - PostgreSQL 16 via Compose para desenvolvimento local.
+- LocalStack com SQS para o ambiente local de mensageria.
 
 ## Configuração local
 
@@ -23,13 +24,59 @@ PostgreSQL publicado somente em `127.0.0.1:55432`. Não é necessário parar ou
 alterar containers de outros projetos.
 
 ```sh
-docker compose up -d postgres
+docker compose up -d postgres localstack
 bun install
 ```
 
 As configurações padrão estão em `.env.example` e também são os defaults da
 aplicação. Para personalizá-las localmente, copie esse arquivo para `.env` e
 ajuste os valores. A senha padrão é apenas para desenvolvimento local.
+O LocalStack deste projeto usa container exclusivo e expõe SQS somente em
+`127.0.0.1:14566`; os nomes das filas vêm de
+`SQS_WAGER_TRANSACTIONS_QUEUE` e `SQS_WAGER_TRANSACTIONS_DLQ`, com defaults
+`wager-transactions.fifo` e `wager-transactions-dlq.fifo`. O script de
+provisionamento e o healthcheck usam essas mesmas variáveis. A fila principal
+tem redrive para a DLQ após cinco recebimentos sem confirmação. O Compose não
+remove nem modifica outros containers ou bancos.
+
+## Contratos de mensageria definidos para a etapa seguinte
+
+O README oficial exige AWS SQS por LocalStack ou MiniStack e assume entrega
+`at-least-once`, com duplicatas, reentregas, múltiplas instâncias e falhas
+temporárias. Ele também exige Inbox/Outbox persistentes e atomicidade SQL, mas
+não fixa nomes de filas nem um envelope completo de mensagens/eventos.
+
+Como decisão deste projeto, a mensagem de entrada usa `messageVersion: 1`,
+`idempotencyKey` e um objeto `transaction` com os campos financeiros e de
+identidade do contrato HTTP. `BET`, `WIN` e `LOSS` são os tipos previstos para
+processamento nesta etapa; `OPENING` nunca é aceito como mensagem externa.
+`REFUND` e `ROLLBACK` permanecem para a etapa 5. Valores monetários são strings
+decimais validadas por `Money`; `playerId` e `walletId` são UUIDs. O
+`messageId` da Inbox será o identificador atribuído pelo SQS, distinto da
+chave de idempotência de negócio.
+
+Os eventos de saída usam envelope versionado (`eventVersion: 1`) com `eventId`
+estável (criado uma vez e persistido com o evento na futura Outbox),
+`eventType`, `occurredAt` em ISO-8601 UTC (`Z`, precisão de até
+milissegundos), `aggregateId` UUID da carteira,
+`payload` e `causationId` / `correlationId` opcionais. Os payloads definidos
+são:
+
+- `WagerTransactionProcessed`: `transactionId`, `providerId`,
+  `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`,
+  `kind`, `money` e `resultBalance`.
+- `WagerTransactionRejected`: mesmos campos, mais `failureCode`.
+- `WalletBalanceChanged`: `transactionId`, `walletId`, `playerId`,
+  `previousBalance` e `balance`.
+
+Valores monetários no payload permanecem strings decimais. A mensagem de
+entrada e os três tipos de evento de saída possuem validadores runtime e
+testes unitários de serialização; os eventos também verificam UUIDs,
+timestamp UTC válido, consistência de moeda e relação entre agregado e wallet.
+Em `WagerTransactionRejected`, a moeda de `money` pode diferir da moeda de
+`resultBalance` quando a rejeição ocorre por incompatibilidade de moeda; os
+eventos de sucesso e de alteração de saldo exigem coerência de moeda.
+Publisher, Inbox, Outbox e consumidor SQS ainda não estão implementados.
 
 ## Banco de dados e migrations
 
