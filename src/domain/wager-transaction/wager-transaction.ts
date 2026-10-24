@@ -27,6 +27,21 @@ export interface CreateOpeningTransactionProps {
   createdAt: Date;
 }
 
+export interface CreateExternalWagerTransactionProps {
+  id: string;
+  providerId: string;
+  externalTransactionId: string;
+  idempotencyKey: string;
+  payloadHash: string;
+  walletId: string;
+  playerId: string;
+  roundId: string;
+  gameId: string;
+  kind: WagerTransactionKind;
+  money: Money;
+  createdAt: Date;
+}
+
 export interface WagerTransactionState {
   id: string;
   providerId: string | null;
@@ -44,6 +59,7 @@ export interface WagerTransactionState {
   createdAt: Date;
   status: WagerTransactionStatus;
   processedAt: Date | null;
+  failureCode: string | null;
 }
 
 export class InvalidWagerTransactionStateError extends Error {
@@ -56,6 +72,7 @@ export class InvalidWagerTransactionStateError extends Error {
 export class WagerTransaction {
   private _status: WagerTransactionStatus;
   private _processedAt: Date | undefined;
+  private _failureCode: string | undefined;
 
   private constructor(
     public readonly id: string,
@@ -74,9 +91,11 @@ export class WagerTransaction {
     public readonly createdAt: Date,
     status: WagerTransactionStatus,
     processedAt: Date | undefined,
+    failureCode: string | undefined,
   ) {
     this._status = status;
     this._processedAt = processedAt ? new Date(processedAt) : undefined;
+    this._failureCode = failureCode;
   }
 
   static createOpening(props: CreateOpeningTransactionProps): WagerTransaction {
@@ -103,6 +122,37 @@ export class WagerTransaction {
       props.createdAt,
       WagerTransactionStatus.Pending,
       undefined,
+      undefined,
+    );
+  }
+
+  static createExternal(
+    props: CreateExternalWagerTransactionProps,
+  ): WagerTransaction {
+    if (props.kind === WagerTransactionKind.Opening) {
+      throw new InvalidWagerTransactionStateError(
+        "OPENING transactions can only be created internally",
+      );
+    }
+
+    return new WagerTransaction(
+      props.id,
+      props.providerId,
+      props.externalTransactionId,
+      props.idempotencyKey,
+      props.payloadHash,
+      props.walletId,
+      props.playerId,
+      props.roundId,
+      props.gameId,
+      props.kind,
+      props.money,
+      null,
+      null,
+      props.createdAt,
+      WagerTransactionStatus.Pending,
+      undefined,
+      undefined,
     );
   }
 
@@ -124,6 +174,7 @@ export class WagerTransaction {
       state.createdAt,
       state.status,
       state.processedAt ?? undefined,
+      state.failureCode ?? undefined,
     );
   }
 
@@ -135,6 +186,10 @@ export class WagerTransaction {
     return this._processedAt ? new Date(this._processedAt) : undefined;
   }
 
+  get failureCode(): string | undefined {
+    return this._failureCode;
+  }
+
   markProcessed(at: Date): void {
     if (this._status !== WagerTransactionStatus.Pending) {
       throw new InvalidWagerTransactionStateError(
@@ -144,6 +199,22 @@ export class WagerTransaction {
 
     this._status = WagerTransactionStatus.Processed;
     this._processedAt = new Date(at);
+  }
+
+  reject(failureCode: string): void {
+    if (this._status !== WagerTransactionStatus.Pending) {
+      throw new InvalidWagerTransactionStateError(
+        `Cannot reject a transaction in state ${this._status}`,
+      );
+    }
+    if (!failureCode.trim()) {
+      throw new InvalidWagerTransactionStateError(
+        "A rejection failure code is required",
+      );
+    }
+
+    this._status = WagerTransactionStatus.Rejected;
+    this._failureCode = failureCode;
   }
 
   toState(): WagerTransactionState {
@@ -164,6 +235,7 @@ export class WagerTransaction {
       createdAt: new Date(this.createdAt),
       status: this._status,
       processedAt: this.processedAt ?? null,
+      failureCode: this._failureCode ?? null,
     };
   }
 }

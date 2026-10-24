@@ -77,4 +77,16 @@ export class WagerTransactionEntity {
 
   @Column({ name: "failure_code", type: "varchar", length: 64, nullable: true })
   failureCode!: string | null;
+
+  @Column({
+    name: "result_balance",
+    type: "numeric",
+    precision: 20,
+    scale: 2,
+    nullable: true,
+  })
+  resultBalance!: string | null;
+
+  @Column({ name: "result_currency", type: "varchar", length: 3, nullable: true })
+  resultCurrency!: string | null;
 }

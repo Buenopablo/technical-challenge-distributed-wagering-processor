@@ -3,6 +3,7 @@ import { DataSource, DataSourceOptions } from "typeorm";
 import { WalletLedgerEntryEntity } from "./entities/wallet-ledger-entry.entity";
 import { WalletEntity } from "./entities/wallet.entity";
 import { WagerTransactionEntity } from "./entities/wager-transaction.entity";
+import { AddWagerIdempotencyResult20261024193000 } from "./migrations/20261024193000-AddWagerIdempotencyResult";
 import { CreateOpeningTransactionsAndLedger20261024190000 } from "./migrations/20261024190000-CreateOpeningTransactionsAndLedger";
 import { CreateWallets20261024180000 } from "./migrations/20261024180000-CreateWallets";
 
@@ -28,6 +29,7 @@ export function createDatabaseOptions(): DataSourceOptions {
     migrations: [
       CreateWallets20261024180000,
       CreateOpeningTransactionsAndLedger20261024190000,
+      AddWagerIdempotencyResult20261024193000,
     ],
     synchronize: false,
     migrationsRun: false,

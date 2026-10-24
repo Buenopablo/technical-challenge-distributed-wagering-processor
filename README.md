@@ -1,14 +1,14 @@
 # Jungle Gaming Backend Challenge
 
 Backend em desenvolvimento para o desafio Distributed Wagering Processor da
-Jungle Gaming. A implementação atual estabelece a fundação NestJS/TypeORM e
-implementa a abertura de carteiras com saldo inicial, incluindo a transação
-interna `OPENING` e seu lançamento de crédito no ledger.
+Jungle Gaming. Além da fundação NestJS/TypeORM e da abertura de carteiras, esta
+etapa implementa `POST /wagering/transactions` para `BET`, `WIN` e `LOSS`, com
+idempotência persistente e processamento transacional no PostgreSQL.
 
 Este projeto ainda não conclui o desafio. As operações BET/WIN/LOSS/REFUND/
-ROLLBACK, a API HTTP, idempotência de operações externas, concorrência do
-processamento de apostas, SQS, Inbox, Outbox, workers e observabilidade ainda
-não estão implementados.
+ROLLBACK não estão todas implementadas: `REFUND` e `ROLLBACK` continuam
+pendentes. Também faltam os endpoints de consulta, processamento SQS, Inbox,
+Outbox, workers, retries, DLQ, reconciliação e observabilidade.
 
 ## Pré-requisitos
 
@@ -90,21 +90,92 @@ para o mesmo jogador e moeda são impedidas pela constraint de unicidade do
 banco.
 
 `OpenWalletUseCase` está registrado como provider NestJS, mas ainda não há
-controller ou rota HTTP que o exponha. A aplicação inicia em
-`http://127.0.0.1:3000`; não existem endpoints de negócio implementados nesta
-etapa.
+rota HTTP que o exponha. O endpoint de transações descrito a seguir já está
+disponível.
+
+## Submeter uma transação de aposta
+
+```http
+POST /wagering/transactions
+Idempotency-Key: provider-a:transaction-123
+Content-Type: application/json
+```
+
+Body conforme o contrato oficial:
+
+```json
+{
+  "providerId": "provider-a",
+  "externalTransactionId": "transaction-123",
+  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+  "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+  "roundId": "round-987",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "25.00", "currency": "BRL" }
+}
+```
+
+`Idempotency-Key` é obrigatório e aceita até 255 caracteres. A API exige os
+campos do exemplo; os identificadores de jogador e carteira devem ser UUIDs.
+Valores monetários são strings decimais com duas casas e moeda ISO suportada
+por `Money`. `OPENING` é interno e não pode ser submetido.
+
+Tipos implementados:
+
+- `BET`: debita o valor; saldo insuficiente é persistido como `REJECTED`, com
+  código `INSUFFICIENT_FUNDS`, sem alterar saldo ou criar ledger.
+- `WIN`: credita o valor.
+- `LOSS`: registra a transação sem alterar saldo ou criar ledger.
+
+O README oficial não define se valores zero devem ser aceitos para essas
+operações. A implementação permite `0.00`: a transação é registrada como
+processada, sem alteração de saldo/versão e sem lançamento no ledger.
+
+Resposta processada (`200`):
+
+```json
+{
+  "transactionId": "0192f298-345e-7e38-af88-e43f851a819d",
+  "status": "PROCESSED",
+  "balance": { "amount": "975.00", "currency": "BRL" },
+  "idempotentReplay": false
+}
+```
+
+Uma repetição idêntica retorna `idempotentReplay: true` e o saldo persistido
+no resultado original, mesmo que a carteira tenha mudado depois. Operações
+processadas retornam `200`; uma rejeição original e seu replay retornam `422`
+com o mesmo resultado e código de falha. O hash SHA-256 considera os campos de
+negócio em JSON com chaves ordenadas; o header e metadados de transporte não
+entram no hash.
+
+Comportamentos HTTP implementados:
+
+| HTTP | Situação |
+| --- | --- |
+| `200` | Processamento bem-sucedido ou replay de operação processada. |
+| `400` | Header ausente, payload inválido, moeda/valor inválido ou tentativa de enviar `OPENING`. |
+| `404` | Carteira inexistente. |
+| `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente. |
+| `422` | Rejeição de negócio. O corpo inclui `transactionId`, `status`, `balance`, `idempotentReplay` e `failureCode`. |
+| `501` | `REFUND` ou `ROLLBACK`, reconhecidos pelo desafio, mas ainda não implementados nesta etapa. |
+| `500` | Falha inesperada de infraestrutura; a transação SQL é revertida. |
+
+O README oficial deixa o mapeamento HTTP a cargo do candidato. Para `409`,
+`400`, `404` e `501`, a resposta usa o formato padrão de exceção do NestJS.
+Falhas de negócio são persistidas e podem ser repetidas com replay do mesmo
+resultado; falhas inesperadas não deixam uma transação parcial persistida.
 
 ## Limitações e próximos passos
 
-- O domínio contém os tipos de transação e estados previstos, mas o fluxo
-  financeiro implementado é somente `OPENING`.
-- `Wallet` tem operações de domínio de crédito e débito, mas ainda não há
-  persistência de alterações de saldo para apostas ou outros tipos.
+- Estão implementados `OPENING`, `BET`, `WIN` e `LOSS`; `REFUND` e `ROLLBACK`
+  ainda não têm fluxo financeiro.
 - Ainda não há endpoints para criar ou consultar carteiras, transações,
   ledger ou reconciliação.
-- Idempotência de transações externas, proteção contra concorrência de
-  apostas, Inbox/Outbox, SQS, retries, DLQ e processamento de referências
-  pendentes não estão implementados.
+- A idempotência persistente e o bloqueio por carteira são implementados para
+  o endpoint desta etapa; o processamento por SQS, Inbox/Outbox, retries, DLQ
+  e referências pendentes ainda não.
 - Ainda não há autenticação, health checks, métricas ou logs estruturados.
 
 Os próximos passos devem seguir o escopo oficial do desafio e acrescentar

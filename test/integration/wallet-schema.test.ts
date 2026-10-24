@@ -254,9 +254,42 @@ describe("wallet opening persistence in PostgreSQL", () => {
     expect(remaining.count).toBe(1);
   });
 
-  test("reverts and reapplies the additive OPENING/ledger migration", async () => {
+  test("reverts and reapplies the wager idempotency and OPENING/ledger migrations", async () => {
     await getTestDataSource().undoLastMigration();
 
+    const resultColumnAfterDown = await getTestDataSource().query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'wager_transactions'
+        AND column_name IN ('result_balance', 'result_currency')
+    `);
+    const openingIndexAfterDown = await getTestDataSource().query(`
+      SELECT indexdef
+      FROM pg_indexes
+      WHERE tablename = 'wager_transactions'
+        AND indexname = 'uq_wager_transactions_opening_key'
+    `);
+    expect(resultColumnAfterDown).toHaveLength(0);
+    expect(openingIndexAfterDown).toHaveLength(1);
+
+    await getTestDataSource().runMigrations();
+    const resultColumnAfterUp = await getTestDataSource().query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'wager_transactions'
+        AND column_name IN ('result_balance', 'result_currency')
+    `);
+    const idempotencyIndexAfterUp = await getTestDataSource().query(`
+      SELECT indexdef
+      FROM pg_indexes
+      WHERE tablename = 'wager_transactions'
+        AND indexname = 'uq_wager_transactions_idempotency_key'
+    `);
+    expect(resultColumnAfterUp).toHaveLength(2);
+    expect(idempotencyIndexAfterUp[0].indexdef).toContain("UNIQUE");
+
+    await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
     const tablesAfterDown = await getTestDataSource().query(`
       SELECT to_regclass('public.wallets') AS wallets,
              to_regclass('public.wager_transactions') AS transactions,
