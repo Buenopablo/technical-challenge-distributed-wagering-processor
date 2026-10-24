@@ -1,0 +1,29 @@
+name: jungle-wagering-foundation
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jungle-wagering-foundation-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-jungle_wagering}
+      POSTGRES_USER: ${DB_USER:-jungle_wagering}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-local-only-password}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - jungle-wagering-foundation-postgres-data:/var/lib/postgresql/data
+    networks:
+      - jungle-wagering-foundation-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  jungle-wagering-foundation-network:
+    name: jungle-wagering-foundation-network
+
+volumes:
+  jungle-wagering-foundation-postgres-data:
+    name: jungle-wagering-foundation-postgres-data
