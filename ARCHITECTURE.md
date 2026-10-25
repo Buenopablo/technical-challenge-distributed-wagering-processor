@@ -15,11 +15,14 @@ As responsabilidades estão organizadas em:
   `WalletLedgerEntry`.
 - `src/application/wallets/` e `src/application/wagering/`: casos de uso de
   abertura e processamento financeiro, que coordenam domínio e persistência.
+- `src/application/outbox/`: reivindicação concorrente, reconstrução e
+  publicação dos eventos persistidos na Outbox.
+- `src/messaging/sqs/`: configuração do cliente SQS do publisher.
 - `src/http/`: controller de `POST /wagering/transactions`, responsável pela
   validação de entrada e pelo mapeamento de erros para HTTP.
 - `src/messaging/contracts/`: contratos versionados e validação de mensagens
-  SQS de entrada e eventos de integração de saída; o schema Inbox/Outbox está
-  mapeado em entidades TypeORM, sem processamento, publisher ou consumidor.
+  SQS de entrada e eventos de integração de saída; o consumidor e o
+  processamento transacional da Inbox ainda não estão implementados.
 - `src/database/entities/`: mapeamento das tabelas PostgreSQL para TypeORM.
 - `src/database/migrations/`: criação versionada e reversível do schema.
 - `src/database/data-source.ts`: opções compartilhadas pela aplicação e pelos
@@ -162,9 +165,9 @@ Outbox.
 Cada operação persistida como `PROCESSED` gera `WagerTransactionProcessed`,
 inclusive `LOSS`. Uma rejeição de negócio persistida gera
 `WagerTransactionRejected`. `WalletBalanceChanged` é criado somente quando a
-operação altera o saldo, com os valores anterior e posterior efetivos. Os IDs
-dos eventos são gerados uma vez para a operação e persistidos como `event_id`;
-esta etapa não implementa publicação nem garante entrega exactly-once.
+operação altera o saldo, com os valores anterior e posterior efetivos. Os IDs dos eventos são gerados uma vez para a operação e persistidos como
+`event_id`; o publisher descrito abaixo reutiliza esse identificador em todas
+as tentativas. O fluxo não garante entrega exactly-once.
 
 O snapshot guarda saldo e moeda da resposta original (`result_balance` e
 `result_currency`). Replay lê esse snapshot na linha de `wager_transactions`;
@@ -220,6 +223,9 @@ e verificada de arquivamento; os snapshots não são descartados silenciosamente
 `outbox_messages`, incluindo unicidade por consumidor/mensagem e por
 `event_id`, constraints de hash/versão/tentativas/payload/claim e índices
 parciais para eventos pendentes e claims expirados.
+- A migration aditiva `AddOutboxFailureState` registra `failed_at` e
+  `last_error`. Seu `down()` bloqueia `outbox_messages` e recusa remover esses
+  campos quando existem dados de falhas terminais.
 
 ### Schema preparado para Inbox e Outbox
 
@@ -238,9 +244,12 @@ Money em payload continua sendo representado como string JSON. O índice parcial
 por `next_attempt_at, created_at` localiza eventos não publicados; outro índice
 parcial cobre claims de eventos pendentes. `claimed_by` e `claim_expires_at`
 são opcionais e a constraint exige que ambos estejam nulos ou preenchidos.
-Os campos de lease são apenas schema: nenhum lease, publisher, polling ou retry
-foi implementado. A Outbox já recebe eventos do processamento HTTP; não há
-publicação SQS nesta etapa.
+O publisher também usa `failed_at`/`last_error` para retirar eventos terminais
+da seleção automática; a constraint garante que falha terminal sempre tenha
+diagnóstico. A Outbox recebe eventos do processamento HTTP na mesma transação
+financeira. A migration aditiva também cria um índice parcial por
+`aggregate_id, created_at, event_id`, usado para ordenar os eventos pendentes
+por agregado.
 
 A reversão da migration bloqueia ambas as tabelas e verifica, antes de
 qualquer operação destrutiva, se qualquer uma contém linhas. Com dados
@@ -300,12 +309,11 @@ compartilhado. A migration de snapshots foi testada para recusar reversão
 quando há transações externas terminais e manter seus dados e sua aplicação.
 
 Ainda previsto: endpoint de abertura e endpoints de consulta; `REFUND` e
-`ROLLBACK`; referências pendentes; processamento SQS e da Inbox, publicação
-Outbox, retries e DLQ;
-reconciliação, health checks, observabilidade e autenticação opcional. Os
-testes ainda não validam execução em três ou mais processos do sistema
-operacional, mensageria nem recovery de workers. Cada componente deve ser
-implementado e validado antes de ser descrito como capacidade disponível.
+`ROLLBACK`; referências pendentes; consumidor SQS, processamento transacional
+da Inbox, retries de consumo e tratamento da DLQ; reconciliação, health checks,
+observabilidade e autenticação opcional. O publisher Outbox é implementado
+abaixo. Os testes ainda não validam execução em três ou mais processos do
+sistema operacional para o publisher.
 
 ## Preparação de SQS e contratos da etapa 4
 
@@ -327,6 +335,12 @@ mesmos atributos, podendo ser repetido sem criar filas duplicadas. A fila de
 entrada tem redrive para a DLQ após cinco recebimentos sem confirmação. FIFO e
 deduplicação do broker serão otimizações de ordenação e tráfego, não a
 garantia de idempotência financeira.
+
+A fila de saída `wager-integration-events.fifo` é provisionada separadamente
+por `SQS_WAGER_INTEGRATION_EVENTS_QUEUE`; não compartilha a DLQ da fila de
+entrada. O publisher usa `SQS_ENDPOINT` para LocalStack, `AWS_REGION` para a
+região, credenciais locais fictícias quando há endpoint customizado e a cadeia
+padrão do SDK para AWS.
 
 A mensagem de entrada proposta tem `messageVersion: 1`, `idempotencyKey` e
 `transaction`. O objeto de transação contém `providerId`,
@@ -354,10 +368,81 @@ operação pode diferir da moeda do snapshot da carteira, por exemplo em uma
 rejeição por incompatibilidade de moeda. Testes cobrem serialização e rejeição
 para cada tipo. A mensagem de entrada também tem validação runtime e testes.
 O caso de uso financeiro HTTP já gera e persiste os eventos na Outbox dentro
-da transação correspondente. A publicação, o consumo e o processamento da
-Inbox serão implementados em subetapas seguintes.
+da transação correspondente.
 
-Não foi adicionada dependência AWS nesta preparação: o Compose provisiona o
-serviço local e os contratos são TypeScript/validados com o domínio existente.
-O AWS SDK para SQS será adicionado somente quando publisher ou consumidor
-forem implementados e sua necessidade confirmada.
+### Publisher da Outbox
+
+`bun run outbox:publish` inicia um processo separado, sem iniciar o servidor
+HTTP. No bootstrap, valida as variáveis do SQS e obtém a URL da fila de saída
+antes de conectar o DataSource e reivindicar qualquer registro. A aplicação
+deve ter migrations aplicadas previamente; o publisher não executa migrations
+automaticamente.
+
+Cada ciclo reivindica no máximo dez eventos não publicados, não terminais e
+com `next_attempt_at <= now()`, sem claim ou com claim expirado. A consulta
+ordena por `next_attempt_at`, `created_at` e `event_id`, usa
+`FOR UPDATE SKIP LOCKED` e grava token UUID único por lote mais lease de 60
+segundos dentro de uma transação curta. A transação é confirmada antes de
+qualquer chamada SQS. Até dez envios de carteiras distintas podem ocorrer em
+paralelo; cada requisição tem timeout de 15 segundos. Somente o evento pendente
+mais antigo de cada carteira fica elegível, de modo que eventos do mesmo
+`MessageGroupId` sejam reivindicados e enviados sequencialmente no fluxo normal;
+carteiras distintas avançam em paralelo. Isso não garante ordenação absoluta:
+se o lease expirar enquanto uma chamada SQS antiga ainda estiver em andamento
+ou tiver resultado ambíguo, ela ainda poderá ser aceita após a publicação de
+um evento posterior.
+O lease inicial é de 60 segundos e é renovado em intervalos durante uma chamada
+SQS ativa. A renovação atualiza somente uma linha pendente cujo token ainda
+corresponde ao publisher. Recuperação de lease expirado e renovação disputam o
+lock da linha no PostgreSQL: se a renovação atualizar primeiro, a recuperação
+observa o novo vencimento; se a recuperação substituir primeiro o token, a
+renovação antiga não atualiza a linha. Claims abandonados ficam elegíveis
+quando expiram.
+
+O publisher reconstrói o envelope completo com `event_id`, tipo, versão,
+`aggregate_id`, `occurred_at`, IDs opcionais não nulos e JSONB `payload`, e
+valida-o por `parseWagerIntegrationEvent()`. Envia o JSON validado com
+`aggregateId` como `MessageGroupId` e `eventId` como
+`MessageDeduplicationId`. Somente depois da resposta SQS tenta preencher
+`published_at`; a atualização confere event ID, estado não publicado e token
+atual, limpando o claim. O vencimento do horário do lease, isoladamente, não
+invalida a atualização; um token substituído impede que o publisher antigo
+altere o estado. O mesmo critério de estado e token é usado para reagendamento
+e falha terminal.
+
+Na operação normal, eventos da carteira são enviados sequencialmente, e um
+evento posterior não é reivindicado enquanto um evento anterior estiver
+pendente. A renovação reduz a chance de um segundo publisher recuperar E1
+durante seu envio ativo. Ela não pode cancelar uma chamada SQS antiga já
+iniciada: se o processo parar de renovar ou ficar pausado além do lease, outro
+publisher pode recuperar E1 e, após sua confirmação, publicar E2; a chamada
+antiga ainda pode ter aceitação tardia. Timeout ambíguo ou falha da confirmação
+PostgreSQL também podem causar republicação. A deduplicação FIFO reduz
+duplicatas somente dentro da janela do SQS e não impede inversões decorrentes
+de uma aceitação tardia. Portanto, o publisher mantém ordenação de seleção e
+envio normal, mas não pode prometer ordenação absoluta nem exactly-once. Para
+uma garantia mais forte, o consumidor futuro precisará validar sequência por
+agregado ou reordenar eventos; esse controle ainda não está implementado.
+
+Uma falha transitória ou timeout incrementa tentativas (contadas na aquisição
+do claim), limpa o claim e agenda novo envio com backoff exponencial iniciado em
+um segundo, jitter entre 0,5x e 1,5x e teto de cinco minutos. Após dez tentativas,
+ou imediatamente diante de contrato inválido ou erro AWS permanente específico
+da mensagem, grava `failed_at` e `last_error`, que retiram a linha da seleção
+automática. Um claim expirado já na décima tentativa também é terminalizado no
+próximo ciclo. Falhas terminais exigem intervenção operacional; não são
+enviadas a uma DLQ. Erros globais conhecidos de fila, parâmetros incompatíveis
+ou credenciais liberam os claims sem consumir tentativas e encerram o processo;
+falha ao obter a fila ocorre antes de qualquer claim. Códigos AWS transitórios
+conhecidos são reagendados; códigos desconhecidos seguem retry limitado e não
+são assumidos como globais ou permanentes de mensagem. SIGINT/SIGTERM impedem
+novos ciclos e aguardam o lote atual terminar, mantendo claims incompletos
+recuperáveis por expiração.
+
+O LocalStack recebe uma fila FIFO temporária exclusiva nos testes do publisher,
+junto a um banco PostgreSQL temporário. O processo de teste remove somente
+esses recursos que criou; não purga filas compartilhadas.
+
+Ainda não há consumidor SQS, processamento da Inbox, confirmação/ack de
+mensagens recebidas, retries de consumo ou tratamento operacional da DLQ de
+entrada. A dependência `@aws-sdk/client-sqs` é usada pelo publisher.

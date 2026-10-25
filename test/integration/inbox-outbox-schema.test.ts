@@ -51,6 +51,7 @@ describe("Inbox and Outbox schema in PostgreSQL", () => {
 
   test("reverts and reapplies the empty Inbox and Outbox migration", async () => {
     await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
 
     const tablesAfterDown = await getTestDataSource().query(`
       SELECT to_regclass('public.inbox_messages') AS inbox,
@@ -58,7 +59,11 @@ describe("Inbox and Outbox schema in PostgreSQL", () => {
     `);
     expect(tablesAfterDown[0]).toEqual({ inbox: null, outbox: null });
 
-    await getTestDataSource().runMigrations();
+    const reapplied = await getTestDataSource().runMigrations();
+    expect(reapplied.map(({ name }) => name)).toEqual([
+      "CreateInboxAndOutbox20261024210000",
+      "AddOutboxFailureState20261025120000",
+    ]);
     const tablesAfterUp = await getTestDataSource().query(`
       SELECT to_regclass('public.inbox_messages') AS inbox,
              to_regclass('public.outbox_messages') AS outbox
@@ -245,6 +250,7 @@ describe("Inbox and Outbox schema in PostgreSQL", () => {
 
   test("refuses rollback with Inbox or Outbox data without removing rows or tables", async () => {
     const dataSource = getTestDataSource();
+    await dataSource.undoLastMigration();
     const [before] = await dataSource.query(`
       SELECT
         (SELECT count(*)::int FROM inbox_messages) AS inbox_count,

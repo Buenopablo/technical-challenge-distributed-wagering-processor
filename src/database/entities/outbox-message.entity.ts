@@ -12,6 +12,10 @@ import {
 @Check("ck_outbox_messages_event_version", `"event_version" > 0`)
 @Check("ck_outbox_messages_attempts", `"attempts" >= 0`)
 @Check(
+  "ck_outbox_messages_failure_pair",
+  `"failed_at" IS NULL OR "last_error" IS NOT NULL`,
+)
+@Check(
   "ck_outbox_messages_payload_object",
   `jsonb_typeof("payload") = 'object'`,
 )
@@ -25,6 +29,13 @@ import {
 @Index("idx_outbox_expired_claims", ["claimExpiresAt"], {
   where: `"published_at" IS NULL AND "claim_expires_at" IS NOT NULL`,
 })
+@Index(
+  "idx_outbox_pending_aggregate_order",
+  ["aggregateId", "createdAt", "eventId"],
+  {
+    where: `"published_at" IS NULL AND "failed_at" IS NULL`,
+  },
+)
 export class OutboxMessageEntity {
   @PrimaryColumn({ name: "event_id", type: "uuid" })
   eventId!: string;
@@ -55,6 +66,12 @@ export class OutboxMessageEntity {
 
   @Column({ name: "published_at", type: "timestamptz", nullable: true })
   publishedAt!: Date | null;
+
+  @Column({ name: "failed_at", type: "timestamptz", nullable: true })
+  failedAt!: Date | null;
+
+  @Column({ name: "last_error", type: "text", nullable: true })
+  lastError!: string | null;
 
   @Column({ type: "integer", default: 0 })
   attempts!: number;

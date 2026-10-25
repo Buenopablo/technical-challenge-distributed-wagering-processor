@@ -7,10 +7,10 @@ idempotência persistente e processamento transacional no PostgreSQL.
 
 Este projeto ainda não conclui o desafio. As operações BET/WIN/LOSS/REFUND/
 ROLLBACK não estão todas implementadas: `REFUND` e `ROLLBACK` continuam
-pendentes. Também faltam os endpoints de consulta, processamento SQS,
-processamento da Inbox, publicação da Outbox, workers, retries, DLQ,
-reconciliação e observabilidade. Eventos financeiros já são persistidos
-transacionalmente na Outbox, mas ainda não são publicados.
+pendentes. Também faltam os endpoints de consulta, consumo SQS,
+processamento da Inbox, retries de consumo, reconciliação e observabilidade.
+Eventos financeiros já são persistidos transacionalmente na Outbox e um
+publisher independente os envia para uma fila SQS FIFO.
 
 ## Pré-requisitos
 
@@ -40,6 +40,13 @@ O LocalStack deste projeto usa container exclusivo e expõe SQS somente em
 provisionamento e o healthcheck usam essas mesmas variáveis. A fila principal
 tem redrive para a DLQ após cinco recebimentos sem confirmação. O Compose não
 remove nem modifica outros containers ou bancos.
+
+A fila de eventos de saída é independente: `SQS_WAGER_INTEGRATION_EVENTS_QUEUE`
+tem default `wager-integration-events.fifo` e não usa a DLQ da fila de entrada.
+O publisher usa `SQS_ENDPOINT` quando configurado, `AWS_REGION` e essa variável
+de fila. Para LocalStack, o SDK recebe credenciais fictícias locais; sem
+endpoint customizado, usa a cadeia padrão de credenciais AWS. Não inclua
+credenciais reais no repositório ou em `.env.example`.
 
 O schema de `inbox_messages` e `outbox_messages` é preparado por migration.
 O fluxo HTTP financeiro grava eventos em `outbox_messages` na mesma transação
@@ -82,8 +89,8 @@ timestamp UTC válido, consistência de moeda e relação entre agregado e walle
 Em `WagerTransactionRejected`, a moeda de `money` pode diferir da moeda de
 `resultBalance` quando a rejeição ocorre por incompatibilidade de moeda; os
 eventos de sucesso e de alteração de saldo exigem coerência de moeda.
-Publisher, consumidor SQS e processamento transacional da Inbox ainda não
-estão implementados; o caso de uso HTTP persiste os eventos na Outbox.
+O publisher de saída está implementado e pode ser executado separadamente; o
+consumidor SQS e o processamento transacional da Inbox continuam pendentes.
 
 ## Banco de dados e migrations
 
@@ -117,9 +124,11 @@ linhas; se houver dados, aborta com erro antes de remover tabelas ou registros.
 `processed_at` é obrigatório porque o modelo previsto insere a linha Inbox na
 mesma transação SQL que conclui o processamento financeiro; esse fluxo ainda
 não está implementado. A Outbox recebe eventos do processamento HTTP na mesma
-transação financeira. Seus campos de agendamento e claim estão preparados
-para uso futuro; nenhum lease, publisher, retry ou polling é executado nesta
-etapa.
+transação financeira. A migration aditiva `AddOutboxFailureState` adiciona
+`failed_at` e `last_error` para falhas terminais do publisher. Sua reversão
+bloqueia a tabela e aborta antes de remover colunas se houver diagnóstico de
+falha persistido. Claims expirados e eventos terminais são cobertos por testes
+de integração em PostgreSQL temporário.
 
 Cada nova transação financeira processada grava `WagerTransactionProcessed`,
 inclusive `LOSS`; uma rejeição de negócio persistida grava
@@ -127,8 +136,67 @@ inclusive `LOSS`; uma rejeição de negócio persistida grava
 saldo muda. Replays idempotentes e conflitos não acrescentam eventos. Uma falha
 ao criar ou gravar qualquer evento reverte a transação financeira inteira,
 incluindo carteira, ledger e snapshot. Os `event_id` persistidos são estáveis
-para publicações futuras. A Outbox ainda não é publicada no SQS, e a entrega
-futura poderá ter duplicatas; não há garantia exactly-once.
+entre tentativas de publicação. A publicação pode gerar duplicatas se o SQS
+aceitar uma mensagem e a confirmação PostgreSQL falhar; não há garantia
+exactly-once.
+
+## Publisher da Outbox
+
+O processo de publicação é independente do servidor HTTP. Depois de iniciar
+PostgreSQL e LocalStack, aplicar as migrations e configurar as variáveis acima,
+execute em outro terminal:
+
+```sh
+bun run outbox:publish
+```
+
+No início, o processo valida a configuração e obtém a URL da fila de eventos
+antes de reivindicar registros. A cada ciclo, reivindica no máximo dez eventos
+e os envia com paralelismo limitado ao tamanho do lote. A seleção considera
+eventos não publicados, não terminais, com `next_attempt_at` vencido e claim
+ausente ou expirado. O claim é gravado em uma transação PostgreSQL curta com
+`FOR UPDATE SKIP LOCKED`; a transação termina antes da chamada de rede. O lease
+inicial é de 60 segundos e é renovado enquanto o envio SQS permanece ativo.
+Claims abandonados podem ser recuperados após expirar; renovação, recuperação e
+confirmação são atualizações condicionais pelo estado pendente e token atual.
+
+O envelope é reconstruído das colunas da Outbox e do JSONB `payload`, validado
+com `parseWagerIntegrationEvent()` e enviado como JSON. `aggregateId` é o
+`MessageGroupId` e `eventId` é o `MessageDeduplicationId` estável. O publisher
+seleciona somente o evento não resolvido mais antigo de cada carteira e envia
+eventos de uma mesma carteira sequencialmente; eventos posteriores permanecem
+bloqueados até o anterior ser publicado ou marcado terminal. O registro só
+recebe `published_at` depois que o SQS confirma. Confirmação, reagendamento e
+falha exigem estado pendente e token ainda atual, mas não rejeitam uma
+atualização apenas porque o horário do lease venceu. A deduplicação FIFO tem
+janela limitada e não elimina a possibilidade de duplicatas.
+
+A renovação reduz a possibilidade de um segundo publisher recuperar um evento
+enquanto a chamada original ainda está ativa, mas não cancela uma requisição SQS
+já iniciada. Pausa do processo, falha prolongada da renovação ou timeout de
+resultado ambíguo ainda podem permitir que uma requisição antiga seja aceita
+depois da recuperação do evento e da publicação de um evento posterior da
+carteira. Portanto, o publisher preserva a ordem na operação normal, mas não
+garante ordenação absoluta nem exactly-once. Uma garantia mais forte exigirá
+sequência/reordenação no consumidor, ainda não implementado.
+
+Falhas de envio são reagendadas com backoff exponencial com jitter, máximo de
+dez tentativas e atraso limitado a cinco minutos. A contagem é incrementada ao
+reivindicar uma tentativa, para que claims abandonados por crash também contem.
+Contrato ou erro AWS permanente específico da mensagem, ou limite de tentativas,
+marca o evento com `failed_at` e `last_error`; isso não é a DLQ do SQS. Erros
+globais conhecidos de fila, parâmetros incompatíveis ou credenciais liberam o
+claim sem consumir tentativa e interrompem o processo. Erros transitórios
+conhecidos e códigos desconhecidos seguem a política explícita de retry limitado;
+códigos desconhecidos não são tratados como erro global nem como falha
+permanente de mensagem. Eventos terminais exigem diagnóstico e intervenção
+operacional.
+SIGINT/SIGTERM impedem novos ciclos e aguardam o lote em curso; claims ainda não
+concluídos permanecem recuperáveis por expiração.
+
+O consumidor SQS, o processamento transacional da Inbox e os retries de
+consumo continuam pendentes. A DLQ provisionada pertence à fila de entrada e
+não participa do retry do publisher Outbox.
 
 ## Verificações e execução
 
@@ -142,12 +210,20 @@ bun run typecheck        # TypeScript estrito, sem emitir arquivos
 bun run build            # build TypeScript de produção
 bun run start            # inicia a aplicação
 bun run start:dev        # inicia com Bun watch
+bun run outbox:publish   # inicia apenas o publisher da Outbox
 ```
 
 Os testes de integração conectam-se ao PostgreSQL configurado, criam um banco
-temporário com nome único, aplicam e revertem migrations e removem esse banco
-ao final. O usuário configurado precisa poder criar e remover databases. Os
+temporário com nome único, aplicam migrations e removem somente esse banco ao
+final. O usuário configurado precisa poder criar e remover databases. O teste
+do publisher também requer o LocalStack do projeto; cria uma fila FIFO
+temporária exclusiva e a remove ao final, sem purgar filas existentes. Os
 testes não limpam nem usam como banco de teste o banco de desenvolvimento.
+Execute o teste direcionado com:
+
+```sh
+bun test test/integration/outbox-publisher.test.ts
+```
 
 ## Fluxo implementado: abertura de carteira
 
@@ -255,8 +331,9 @@ resultado; falhas inesperadas não deixam uma transação parcial persistida.
   ledger ou reconciliação.
 - A idempotência persistente e o bloqueio por carteira são implementados para
   o endpoint desta etapa; a gravação transacional de eventos na Outbox também
-  está implementada. Processamento por SQS, Inbox transacional, publisher,
-  retries, DLQ e referências pendentes ainda não.
+  está implementada, assim como o publisher da Outbox para uma fila FIFO de
+  saída. Consumidor SQS, Inbox transacional, retries de consumo, processamento
+  da DLQ e referências pendentes ainda não.
 - Ainda não há autenticação, health checks, métricas ou logs estruturados.
 
 Os próximos passos devem seguir o escopo oficial do desafio e acrescentar

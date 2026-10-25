@@ -259,6 +259,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
   test("reverts and reapplies the wager idempotency and OPENING/ledger migrations", async () => {
     await getTestDataSource().undoLastMigration();
     await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
 
     const resultColumnAfterDown = await getTestDataSource().query(`
       SELECT column_name
@@ -291,6 +292,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
     expect(resultColumnAfterUp).toHaveLength(2);
     expect(idempotencyIndexAfterUp[0].indexdef).toContain("UNIQUE");
 
+    await getTestDataSource().undoLastMigration();
     await getTestDataSource().undoLastMigration();
     await getTestDataSource().undoLastMigration();
     await getTestDataSource().undoLastMigration();
@@ -338,6 +340,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
 
     await getTestDataSource().query("DELETE FROM outbox_messages");
     await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
     await expect(getTestDataSource().undoLastMigration()).rejects.toThrow(
       /external terminal transactions exist and require their result snapshots/,
     );
@@ -355,6 +358,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
     const reappliedInboxOutbox = await getTestDataSource().runMigrations();
     expect(reappliedInboxOutbox.map(({ name }) => name)).toEqual([
       "CreateInboxAndOutbox20261024210000",
+      "AddOutboxFailureState20261025120000",
     ]);
   });
 });

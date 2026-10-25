@@ -4,6 +4,7 @@ set -eu
 region="${AWS_DEFAULT_REGION:-us-east-1}"
 dead_letter_queue="${SQS_WAGER_TRANSACTIONS_DLQ:-wager-transactions-dlq.fifo}"
 transactions_queue="${SQS_WAGER_TRANSACTIONS_QUEUE:-wager-transactions.fifo}"
+integration_events_queue="${SQS_WAGER_INTEGRATION_EVENTS_QUEUE:-wager-integration-events.fifo}"
 
 case "$transactions_queue" in
   *.fifo) ;;
@@ -13,8 +14,14 @@ case "$dead_letter_queue" in
   *.fifo) ;;
   *) echo "SQS_WAGER_TRANSACTIONS_DLQ must end in .fifo" >&2; exit 1 ;;
 esac
-if [ "$transactions_queue" = "$dead_letter_queue" ]; then
-  echo "The transaction queue and its DLQ must have different names" >&2
+case "$integration_events_queue" in
+  *.fifo) ;;
+  *) echo "SQS_WAGER_INTEGRATION_EVENTS_QUEUE must end in .fifo" >&2; exit 1 ;;
+esac
+if [ "$transactions_queue" = "$dead_letter_queue" ] ||
+  [ "$transactions_queue" = "$integration_events_queue" ] ||
+  [ "$dead_letter_queue" = "$integration_events_queue" ]; then
+  echo "Transaction, integration-events, and DLQ queues must have different names" >&2
   exit 1
 fi
 
@@ -53,4 +60,11 @@ awslocal sqs create-queue \
   --attributes "$transactions_attributes" \
   --output text >/dev/null
 
-echo "Provisioned SQS queues: $transactions_queue and $dead_letter_queue"
+integration_events_attributes='{"FifoQueue":"true","ContentBasedDeduplication":"false","VisibilityTimeout":"30","ReceiveMessageWaitTimeSeconds":"20"}'
+awslocal sqs create-queue \
+  --region "$region" \
+  --queue-name "$integration_events_queue" \
+  --attributes "$integration_events_attributes" \
+  --output text >/dev/null
+
+echo "Provisioned SQS queues: $transactions_queue, $integration_events_queue, and $dead_letter_queue"
