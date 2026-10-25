@@ -18,8 +18,8 @@ As responsabilidades estão organizadas em:
 - `src/http/`: controller de `POST /wagering/transactions`, responsável pela
   validação de entrada e pelo mapeamento de erros para HTTP.
 - `src/messaging/contracts/`: contratos versionados e validação de mensagens
-  SQS de entrada e eventos de integração de saída; não contém ainda publisher,
-  consumidor, Inbox ou Outbox.
+  SQS de entrada e eventos de integração de saída; o schema Inbox/Outbox está
+  mapeado em entidades TypeORM, sem processamento, publisher ou consumidor.
 - `src/database/entities/`: mapeamento das tabelas PostgreSQL para TypeORM.
 - `src/database/migrations/`: criação versionada e reversível do schema.
 - `src/database/data-source.ts`: opções compartilhadas pela aplicação e pelos
@@ -201,6 +201,37 @@ antes de qualquer operação destrutiva se encontrar alguma. Sem esses snapshots
 não é possível reproduzir com segurança as respostas originais em replays.
 Para reverter após operações financeiras, é necessária uma estratégia separada
 e verificada de arquivamento; os snapshots não são descartados silenciosamente.
+- A migration `CreateInboxAndOutbox` cria `inbox_messages` e
+`outbox_messages`, incluindo unicidade por consumidor/mensagem e por
+`event_id`, constraints de hash/versão/tentativas/payload/claim e índices
+parciais para eventos pendentes e claims expirados.
+
+### Schema preparado para Inbox e Outbox
+
+`InboxMessageEntity` mapeia `consumer_name`, `message_id`, hash SHA-256,
+`received_at` e `processed_at`. A chave primária composta por consumidor e
+mensagem impede duplicação para o mesmo consumidor sem impedir consumidores
+distintos de tratarem a mesma mensagem. `processed_at` é `NOT NULL` e recebe
+default de banco; a semântica pretendida é inserir essa linha dentro da mesma
+transação SQL que conclui a operação financeira. Ainda não existe código de
+consumidor nem esse processamento transacional.
+
+`OutboxMessageEntity` mapeia o envelope do evento (`event_id`, tipo, versão,
+agregado, instante de ocorrência, causation/correlation IDs) e seu payload
+JSONB, além de criação, publicação, tentativas e próximo instante de tentativa.
+Money em payload continua sendo representado como string JSON. O índice parcial
+por `next_attempt_at, created_at` localiza eventos não publicados; outro índice
+parcial cobre claims de eventos pendentes. `claimed_by` e `claim_expires_at`
+são opcionais e a constraint exige que ambos estejam nulos ou preenchidos.
+Esses campos são apenas schema: nenhum lease, publisher, polling ou retry foi
+implementado.
+
+A reversão da migration bloqueia ambas as tabelas e verifica, antes de
+qualquer operação destrutiva, se qualquer uma contém linhas. Com dados
+presentes ela aborta com mensagem explícita e preserva tabelas e registros,
+sem permitir uma inserção concorrente entre a verificação e o drop. A reversão
+e reaplicação em banco temporário vazio são cobertas por testes de integração
+PostgreSQL.
 
 ## Decisões e trade-offs
 
@@ -253,7 +284,8 @@ compartilhado. A migration de snapshots foi testada para recusar reversão
 quando há transações externas terminais e manter seus dados e sua aplicação.
 
 Ainda previsto: endpoint de abertura e endpoints de consulta; `REFUND` e
-`ROLLBACK`; referências pendentes; SQS, Inbox, Outbox, retries e DLQ;
+`ROLLBACK`; referências pendentes; processamento SQS e da Inbox/Outbox, retries
+e DLQ;
 reconciliação, health checks, observabilidade e autenticação opcional. Os
 testes ainda não validam execução em três ou mais processos do sistema
 operacional, mensageria nem recovery de workers. Cada componente deve ser
@@ -290,7 +322,8 @@ O `messageId` de transporte virá dos atributos do SQS; não substitui a
 `idempotencyKey` de negócio.
 
 Os eventos de saída definidos para operações atuais compartilham um envelope
-com `eventId` criado uma vez e persistido com o evento na futura Outbox,
+com `eventId` criado uma vez e destinado a ser persistido com o evento na
+Outbox já criada,
 `eventType`, `eventVersion: 1`, `occurredAt` ISO-8601 UTC com sufixo `Z` e
 precisão de até milissegundos, `aggregateId` (UUID da wallet), `payload` e
 `causationId`/`correlationId` opcionais.

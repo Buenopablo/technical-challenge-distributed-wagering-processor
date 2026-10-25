@@ -258,6 +258,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
 
   test("reverts and reapplies the wager idempotency and OPENING/ledger migrations", async () => {
     await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
 
     const resultColumnAfterDown = await getTestDataSource().query(`
       SELECT column_name
@@ -292,6 +293,7 @@ describe("wallet opening persistence in PostgreSQL", () => {
 
     await getTestDataSource().undoLastMigration();
     await getTestDataSource().undoLastMigration();
+    await getTestDataSource().undoLastMigration();
     const tablesAfterDown = await getTestDataSource().query(`
       SELECT to_regclass('public.wallets') AS wallets,
              to_regclass('public.wager_transactions') AS transactions,
@@ -317,6 +319,8 @@ describe("wallet opening persistence in PostgreSQL", () => {
   });
 
   test("refuses to revert idempotency snapshots needed by terminal transactions", async () => {
+    await getTestDataSource().undoLastMigration();
+
     const wallet = await createOpenWalletUseCase().execute({
       playerId: randomUUID(),
       initialBalance: { amount: "100.00", currency: "BRL" },
@@ -348,6 +352,9 @@ describe("wallet opening persistence in PostgreSQL", () => {
       result_balance: "90.00",
       result_currency: "BRL",
     });
-    expect(await getTestDataSource().runMigrations()).toEqual([]);
+    const reappliedInboxOutbox = await getTestDataSource().runMigrations();
+    expect(reappliedInboxOutbox.map(({ name }) => name)).toEqual([
+      "CreateInboxAndOutbox20261024210000",
+    ]);
   });
 });

@@ -3,6 +3,9 @@ import { DataSource, DataSourceOptions } from "typeorm";
 import { WalletLedgerEntryEntity } from "./entities/wallet-ledger-entry.entity";
 import { WalletEntity } from "./entities/wallet.entity";
 import { WagerTransactionEntity } from "./entities/wager-transaction.entity";
+import { InboxMessageEntity } from "./entities/inbox-message.entity";
+import { OutboxMessageEntity } from "./entities/outbox-message.entity";
+import { CreateInboxAndOutbox20261024210000 } from "./migrations/20261024210000-CreateInboxAndOutbox";
 import { AddWagerIdempotencyResult20261024193000 } from "./migrations/20261024193000-AddWagerIdempotencyResult";
 import { CreateOpeningTransactionsAndLedger20261024190000 } from "./migrations/20261024190000-CreateOpeningTransactionsAndLedger";
 import { CreateWallets20261024180000 } from "./migrations/20261024180000-CreateWallets";
@@ -25,14 +28,22 @@ export function createDatabaseOptions(): DataSourceOptions {
     username: process.env.DB_USER ?? "jungle_wagering",
     password: process.env.DB_PASSWORD ?? "local-only-password",
     database: process.env.DB_NAME ?? "jungle_wagering",
-    entities: [WalletEntity, WagerTransactionEntity, WalletLedgerEntryEntity],
+    entities: [
+      WalletEntity,
+      WagerTransactionEntity,
+      WalletLedgerEntryEntity,
+      InboxMessageEntity,
+      OutboxMessageEntity,
+    ],
     migrations: [
       CreateWallets20261024180000,
       CreateOpeningTransactionsAndLedger20261024190000,
       AddWagerIdempotencyResult20261024193000,
+      CreateInboxAndOutbox20261024210000,
     ],
     synchronize: false,
     migrationsRun: false,
+    migrationsTransactionMode: "all",
   };
 }
 

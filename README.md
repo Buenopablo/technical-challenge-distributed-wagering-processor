@@ -7,8 +7,10 @@ idempotência persistente e processamento transacional no PostgreSQL.
 
 Este projeto ainda não conclui o desafio. As operações BET/WIN/LOSS/REFUND/
 ROLLBACK não estão todas implementadas: `REFUND` e `ROLLBACK` continuam
-pendentes. Também faltam os endpoints de consulta, processamento SQS, Inbox,
-Outbox, workers, retries, DLQ, reconciliação e observabilidade.
+pendentes. Também faltam os endpoints de consulta, processamento SQS,
+processamento da Inbox, publicação da Outbox, workers, retries, DLQ,
+reconciliação e observabilidade. O schema da Inbox/Outbox já está criado, mas
+não há processamento ou publicação implementados.
 
 ## Pré-requisitos
 
@@ -39,6 +41,9 @@ provisionamento e o healthcheck usam essas mesmas variáveis. A fila principal
 tem redrive para a DLQ após cinco recebimentos sem confirmação. O Compose não
 remove nem modifica outros containers ou bancos.
 
+O schema de `inbox_messages` e `outbox_messages` é preparado por migration,
+mas ainda não é usado por um consumidor ou publisher.
+
 ## Contratos de mensageria definidos para a etapa seguinte
 
 O README oficial exige AWS SQS por LocalStack ou MiniStack e assume entrega
@@ -56,7 +61,7 @@ decimais validadas por `Money`; `playerId` e `walletId` são UUIDs. O
 chave de idempotência de negócio.
 
 Os eventos de saída usam envelope versionado (`eventVersion: 1`) com `eventId`
-estável (criado uma vez e persistido com o evento na futura Outbox),
+estável (destinado a ser persistido com o evento na Outbox já criada),
 `eventType`, `occurredAt` em ISO-8601 UTC (`Z`, precisão de até
 milissegundos), `aggregateId` UUID da carteira,
 `payload` e `causationId` / `correlationId` opcionais. Os payloads definidos
@@ -76,7 +81,8 @@ timestamp UTC válido, consistência de moeda e relação entre agregado e walle
 Em `WagerTransactionRejected`, a moeda de `money` pode diferir da moeda de
 `resultBalance` quando a rejeição ocorre por incompatibilidade de moeda; os
 eventos de sucesso e de alteração de saldo exigem coerência de moeda.
-Publisher, Inbox, Outbox e consumidor SQS ainda não estão implementados.
+Publisher, consumidor SQS e processamento transacional da Inbox/Outbox ainda
+não estão implementados; nesta etapa há somente os contratos e o schema.
 
 ## Banco de dados e migrations
 
@@ -103,6 +109,15 @@ pois removeria os saldos originais necessários para responder a replays. Nesse
 caso, a migration não faz alterações. Uma reversão exige uma estratégia de
 arquivamento dos snapshots verificada separadamente; não se deve contornar a
 proteção apagando transações.
+
+A migration `CreateInboxAndOutbox` cria as tabelas de Inbox e Outbox. Sua
+reversão bloqueia as tabelas e verifica primeiro se qualquer uma contém
+linhas; se houver dados, aborta com erro antes de remover tabelas ou registros.
+`processed_at` é obrigatório porque o modelo previsto insere a linha Inbox na
+mesma transação SQL que conclui o processamento financeiro; esse fluxo ainda
+não está implementado. A Outbox já possui campos de agendamento e claim para
+uso futuro, mas nenhum lease, publisher, retry ou polling é executado nesta
+etapa.
 
 ## Verificações e execução
 
@@ -228,8 +243,9 @@ resultado; falhas inesperadas não deixam uma transação parcial persistida.
 - Ainda não há endpoints para criar ou consultar carteiras, transações,
   ledger ou reconciliação.
 - A idempotência persistente e o bloqueio por carteira são implementados para
-  o endpoint desta etapa; o processamento por SQS, Inbox/Outbox, retries, DLQ
-  e referências pendentes ainda não.
+  o endpoint desta etapa; o schema Inbox/Outbox existe, mas processamento por
+  SQS, escrita transacional da Inbox/Outbox, publisher, retries, DLQ e referências
+  pendentes ainda não.
 - Ainda não há autenticação, health checks, métricas ou logs estruturados.
 
 Os próximos passos devem seguir o escopo oficial do desafio e acrescentar
