@@ -150,6 +150,21 @@ hash e abre uma transação TypeORM/PostgreSQL.
    alteram versão/saldo.
 6. Atualiza estado final e snapshot do resultado original e confirma a mesma
    transação SQL.
+7. Constrói os eventos de integração, valida cada um com
+   `parseWagerIntegrationEvent()` e insere os registros Outbox pelo mesmo
+   `EntityManager`, antes de a transação confirmar.
+
+Uma falha na construção, validação ou inserção de evento propaga erro e reverte
+também a transação financeira, carteira, ledger e snapshot. Replays e conflitos
+retornam antes da criação dos eventos; por isso não acrescentam registros à
+Outbox.
+
+Cada operação persistida como `PROCESSED` gera `WagerTransactionProcessed`,
+inclusive `LOSS`. Uma rejeição de negócio persistida gera
+`WagerTransactionRejected`. `WalletBalanceChanged` é criado somente quando a
+operação altera o saldo, com os valores anterior e posterior efetivos. Os IDs
+dos eventos são gerados uma vez para a operação e persistidos como `event_id`;
+esta etapa não implementa publicação nem garante entrega exactly-once.
 
 O snapshot guarda saldo e moeda da resposta original (`result_balance` e
 `result_currency`). Replay lê esse snapshot na linha de `wager_transactions`;
@@ -223,8 +238,9 @@ Money em payload continua sendo representado como string JSON. O índice parcial
 por `next_attempt_at, created_at` localiza eventos não publicados; outro índice
 parcial cobre claims de eventos pendentes. `claimed_by` e `claim_expires_at`
 são opcionais e a constraint exige que ambos estejam nulos ou preenchidos.
-Esses campos são apenas schema: nenhum lease, publisher, polling ou retry foi
-implementado.
+Os campos de lease são apenas schema: nenhum lease, publisher, polling ou retry
+foi implementado. A Outbox já recebe eventos do processamento HTTP; não há
+publicação SQS nesta etapa.
 
 A reversão da migration bloqueia ambas as tabelas e verifica, antes de
 qualquer operação destrutiva, se qualquer uma contém linhas. Com dados
@@ -284,8 +300,8 @@ compartilhado. A migration de snapshots foi testada para recusar reversão
 quando há transações externas terminais e manter seus dados e sua aplicação.
 
 Ainda previsto: endpoint de abertura e endpoints de consulta; `REFUND` e
-`ROLLBACK`; referências pendentes; processamento SQS e da Inbox/Outbox, retries
-e DLQ;
+`ROLLBACK`; referências pendentes; processamento SQS e da Inbox, publicação
+Outbox, retries e DLQ;
 reconciliação, health checks, observabilidade e autenticação opcional. Os
 testes ainda não validam execução em três ou mais processos do sistema
 operacional, mensageria nem recovery de workers. Cada componente deve ser
@@ -322,8 +338,7 @@ O `messageId` de transporte virá dos atributos do SQS; não substitui a
 `idempotencyKey` de negócio.
 
 Os eventos de saída definidos para operações atuais compartilham um envelope
-com `eventId` criado uma vez e destinado a ser persistido com o evento na
-Outbox já criada,
+com `eventId` criado uma vez e persistido com o evento na Outbox,
 `eventType`, `eventVersion: 1`, `occurredAt` ISO-8601 UTC com sufixo `Z` e
 precisão de até milissegundos, `aggregateId` (UUID da wallet), `payload` e
 `causationId`/`correlationId` opcionais.
@@ -338,8 +353,9 @@ moeda e coerência entre `aggregateId` e `walletId`; em rejeições, a moeda da
 operação pode diferir da moeda do snapshot da carteira, por exemplo em uma
 rejeição por incompatibilidade de moeda. Testes cobrem serialização e rejeição
 para cada tipo. A mensagem de entrada também tem validação runtime e testes.
-O mecanismo de geração/publicação, persistência Outbox e consumo ainda serão
-implementados nas subetapas seguintes.
+O caso de uso financeiro HTTP já gera e persiste os eventos na Outbox dentro
+da transação correspondente. A publicação, o consumo e o processamento da
+Inbox serão implementados em subetapas seguintes.
 
 Não foi adicionada dependência AWS nesta preparação: o Compose provisiona o
 serviço local e os contratos são TypeScript/validados com o domínio existente.

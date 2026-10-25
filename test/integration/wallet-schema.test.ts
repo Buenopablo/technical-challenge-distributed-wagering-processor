@@ -319,8 +319,6 @@ describe("wallet opening persistence in PostgreSQL", () => {
   });
 
   test("refuses to revert idempotency snapshots needed by terminal transactions", async () => {
-    await getTestDataSource().undoLastMigration();
-
     const wallet = await createOpenWalletUseCase().execute({
       playerId: randomUUID(),
       initialBalance: { amount: "100.00", currency: "BRL" },
@@ -338,6 +336,8 @@ describe("wallet opening persistence in PostgreSQL", () => {
       money: { amount: "10.00", currency: "BRL" },
     });
 
+    await getTestDataSource().query("DELETE FROM outbox_messages");
+    await getTestDataSource().undoLastMigration();
     await expect(getTestDataSource().undoLastMigration()).rejects.toThrow(
       /external terminal transactions exist and require their result snapshots/,
     );

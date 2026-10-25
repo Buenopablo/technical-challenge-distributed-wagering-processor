@@ -19,6 +19,8 @@ import {
 import { WalletEntity } from "../../database/entities/wallet.entity";
 import { WagerTransactionEntity } from "../../database/entities/wager-transaction.entity";
 import { WalletLedgerEntryEntity } from "../../database/entities/wallet-ledger-entry.entity";
+import { OutboxMessageEntity } from "../../database/entities/outbox-message.entity";
+import { createWagerIntegrationEvents } from "./wager-integration-event.factory";
 
 export type SupportedWagerKind =
   | WagerTransactionKind.Bet
@@ -288,6 +290,40 @@ export class ProcessWagerTransactionUseCase {
           resultCurrency: wallet.currency,
         },
       );
+
+      const events = createWagerIntegrationEvents({
+        transactionId: transaction.id,
+        providerId: input.providerId,
+        externalTransactionId: input.externalTransactionId,
+        playerId: input.playerId,
+        walletId: input.walletId,
+        roundId: input.roundId,
+        gameId: input.gameId,
+        kind: input.kind,
+        money: money.toJSON(),
+        resultBalance: wallet.balance.toJSON(),
+        ...(ledgerEntry
+          ? { previousBalance: ledgerEntry.balanceBefore.toJSON() }
+          : {}),
+        occurredAt: at,
+        result: failureCode
+          ? { status: "REJECTED", failureCode }
+          : { status: "PROCESSED" },
+      });
+
+      for (const event of events) {
+        const outboxEntity = manager.create(OutboxMessageEntity, {
+          eventId: event.eventId,
+          eventType: event.eventType,
+          eventVersion: event.eventVersion,
+          aggregateId: event.aggregateId,
+          payload: event.payload,
+          occurredAt: new Date(event.occurredAt),
+          causationId: event.causationId ?? null,
+          correlationId: event.correlationId ?? null,
+        });
+        await manager.save(OutboxMessageEntity, outboxEntity);
+      }
 
       return {
         transactionId: transaction.id,

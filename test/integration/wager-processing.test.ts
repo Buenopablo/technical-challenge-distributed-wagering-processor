@@ -13,6 +13,10 @@ import {
 import { createDatabaseOptions } from "../../src/database/data-source";
 import { WagerTransactionKind } from "../../src/domain/wager-transaction/wager-transaction";
 import { WagerTransactionsController } from "../../src/http/wager-transactions.controller";
+import {
+  parseWagerIntegrationEvent,
+  WagerIntegrationEvent,
+} from "../../src/messaging/contracts/integration-event";
 
 let testDataSource: DataSource | undefined;
 let adminDataSource: DataSource | undefined;
@@ -146,6 +150,48 @@ async function countByValue(
   return row.count as number;
 }
 
+async function outboxEventsForTransaction(
+  transactionId: string,
+): Promise<WagerIntegrationEvent[]> {
+  const rows = (await getTestDataSource().query(
+    `SELECT event_id, event_type, event_version, aggregate_id, occurred_at,
+            causation_id, correlation_id, payload
+     FROM outbox_messages
+     WHERE payload ->> 'transactionId' = $1
+     ORDER BY event_type`,
+    [transactionId],
+  )) as Array<{
+    event_id: string;
+    event_type: string;
+    event_version: number;
+    aggregate_id: string;
+    occurred_at: Date;
+    causation_id: string | null;
+    correlation_id: string | null;
+    payload: Record<string, unknown>;
+  }>;
+
+  return rows.map((row) =>
+    parseWagerIntegrationEvent({
+      eventId: row.event_id,
+      eventType: row.event_type,
+      eventVersion: row.event_version,
+      occurredAt: row.occurred_at.toISOString(),
+      aggregateId: row.aggregate_id,
+      ...(row.causation_id ? { causationId: row.causation_id } : {}),
+      ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
+      payload: row.payload,
+    }),
+  );
+}
+
+function transactionIdFrom(body: Record<string, unknown>): string {
+  if (typeof body.transactionId !== "string") {
+    throw new Error("Expected a transactionId in the HTTP response");
+  }
+  return body.transactionId;
+}
+
 async function responseBody(response: Response): Promise<Record<string, unknown>> {
   const body: unknown = await response.json();
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
@@ -232,7 +278,8 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       requestBody(wallet, WagerTransactionKind.Win, "10.00"),
     );
     expect(winResponse.status).toBe(200);
-    expect(await winResponse.json()).toMatchObject({
+    const winResult = await responseBody(winResponse);
+    expect(winResult).toMatchObject({
       balance: { amount: "85.00", currency: "BRL" },
     });
 
@@ -241,7 +288,8 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       requestBody(wallet, WagerTransactionKind.Loss, "10.00"),
     );
     expect(lossResponse.status).toBe(200);
-    expect(await lossResponse.json()).toMatchObject({
+    const lossResult = await responseBody(lossResponse);
+    expect(lossResult).toMatchObject({
       balance: { amount: "85.00", currency: "BRL" },
     });
     expect(
@@ -250,6 +298,45 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     expect(
       await countByValue("wallet_ledger_entries", "direction", "CREDIT", wallet.id),
     ).toBe(2);
+
+    const betEvents = await outboxEventsForTransaction(
+      transactionIdFrom(betResult),
+    );
+    expect(betEvents).toHaveLength(2);
+    expect(betEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "WagerTransactionProcessed",
+          payload: expect.objectContaining({
+            kind: "BET",
+            money: { amount: "25.00", currency: "BRL" },
+            resultBalance: { amount: "75.00", currency: "BRL" },
+          }),
+        }),
+        expect.objectContaining({
+          eventType: "WalletBalanceChanged",
+          payload: expect.objectContaining({
+            previousBalance: { amount: "100.00", currency: "BRL" },
+            balance: { amount: "75.00", currency: "BRL" },
+          }),
+        }),
+      ]),
+    );
+
+    expect(await outboxEventsForTransaction(transactionIdFrom(winResult))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ eventType: "WagerTransactionProcessed" }),
+        expect.objectContaining({ eventType: "WalletBalanceChanged" }),
+      ]),
+    );
+    const lossEvents = await outboxEventsForTransaction(
+      transactionIdFrom(lossResult),
+    );
+    expect(lossEvents).toHaveLength(1);
+    expect(lossEvents[0]).toMatchObject({
+      eventType: "WagerTransactionProcessed",
+      payload: { kind: "LOSS" },
+    });
   });
 
   test("allows zero without changing balance, version, or ledger", async () => {
@@ -259,7 +346,8 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       requestBody(wallet, WagerTransactionKind.Bet, "0.00"),
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    const result = await responseBody(response);
+    expect(result).toMatchObject({
       status: "PROCESSED",
       balance: { amount: "10.00", currency: "BRL" },
     });
@@ -270,6 +358,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     );
     expect(persisted.version).toBe(1);
     expect(await countRows("wallet_ledger_entries", wallet.id)).toBe(1);
+    const events = await outboxEventsForTransaction(transactionIdFrom(result));
+    expect(events).toHaveLength(1);
+    expect(events[0].eventType).toBe("WagerTransactionProcessed");
   });
 
   test("returns the wallet currency in a persisted currency-mismatch rejection", async () => {
@@ -283,10 +374,23 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     };
     const response = await submit("provider-a:currency-mismatch", body);
     expect(response.status).toBe(422);
-    expect(await responseBody(response)).toMatchObject({
+    const originalResponse = await responseBody(response);
+    expect(originalResponse).toMatchObject({
       status: "REJECTED",
       balance: { amount: "10.00", currency: "USD" },
       failureCode: "WALLET_CURRENCY_MISMATCH",
+    });
+    const originalEvents = await outboxEventsForTransaction(
+      transactionIdFrom(originalResponse),
+    );
+    expect(originalEvents).toHaveLength(1);
+    expect(originalEvents[0]).toMatchObject({
+      eventType: "WagerTransactionRejected",
+      payload: {
+        failureCode: "WALLET_CURRENCY_MISMATCH",
+        money: { amount: "2.00", currency: "BRL" },
+        resultBalance: { amount: "10.00", currency: "USD" },
+      },
     });
 
     const replay = await submit("provider-a:currency-mismatch", body);
@@ -295,6 +399,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       balance: { amount: "10.00", currency: "USD" },
       idempotentReplay: true,
     });
+    expect(
+      await outboxEventsForTransaction(transactionIdFrom(originalResponse)),
+    ).toEqual(originalEvents);
   });
 
   test("persists player mismatch rejection without changing wallet or ledger", async () => {
@@ -373,6 +480,10 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     const body = requestBody(wallet, WagerTransactionKind.Bet, "101.00");
     const first = await submit(key, body);
     expect(first.status).toBe(422);
+    const originalResponse = await responseBody(first);
+    const originalEvents = await outboxEventsForTransaction(
+      transactionIdFrom(originalResponse),
+    );
 
     await submit(
       "provider-a:later-credit",
@@ -386,6 +497,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       idempotentReplay: true,
       failureCode: "INSUFFICIENT_FUNDS",
     });
+    expect(
+      await outboxEventsForTransaction(transactionIdFrom(originalResponse)),
+    ).toEqual(originalEvents);
   });
 
   test("replays the original balance after the wallet has changed", async () => {
@@ -393,6 +507,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     const firstBody = requestBody(wallet, WagerTransactionKind.Win, "10.00");
     const first = await submit("provider-a:replay-first", firstBody);
     const originalResult = await responseBody(first);
+    const originalEvents = await outboxEventsForTransaction(
+      transactionIdFrom(originalResult),
+    );
     await submit(
       "provider-a:replay-second",
       requestBody(wallet, WagerTransactionKind.Win, "5.00"),
@@ -405,6 +522,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       idempotentReplay: true,
     });
     expect(await countRows("wallet_ledger_entries", wallet.id)).toBe(3);
+    expect(
+      await outboxEventsForTransaction(transactionIdFrom(originalResult)),
+    ).toEqual(originalEvents);
   });
 
   test("returns conflict for a reused key with a different business payload", async () => {
@@ -415,6 +535,10 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       requestBody(wallet, WagerTransactionKind.Win, "10.00"),
     );
     expect(first.status).toBe(200);
+    const firstResult = await responseBody(first);
+    const originalEvents = await outboxEventsForTransaction(
+      transactionIdFrom(firstResult),
+    );
 
     const conflict = await submit(
       key,
@@ -423,6 +547,9 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     expect(conflict.status).toBe(409);
     expect(await countByValue("wager_transactions", "kind", "WIN", wallet.id)).toBe(1);
     expect(await countByValue("wallet_ledger_entries", "direction", "CREDIT", wallet.id)).toBe(2);
+    expect(
+      await outboxEventsForTransaction(transactionIdFrom(firstResult)),
+    ).toEqual(originalEvents);
   });
 
   test("distinguishes malformed requests from valid operations not implemented in this stage", async () => {
@@ -549,6 +676,14 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
     expect(
       await countByValue("wallet_ledger_entries", "direction", "DEBIT", wallet.id),
     ).toBe(1);
+    const persistedEvents = await outboxEventsForTransaction(
+      transactionIdFrom(bodies[0]),
+    );
+    expect(persistedEvents).toHaveLength(2);
+    expect(persistedEvents.map(({ eventType }) => eventType).sort()).toEqual([
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
 
     const [persistedWallet] = await getTestDataSource().query(
       "SELECT balance FROM wallets WHERE id = $1",
@@ -652,6 +787,73 @@ describe("wager transaction HTTP and PostgreSQL integration", () => {
       );
       await getTestDataSource().query(
         "DROP FUNCTION IF EXISTS fail_test_wager_ledger_insert()",
+      );
+    }
+  });
+
+  test("rolls back processed and rejected transactions when Outbox insertion fails", async () => {
+    const wallet = await createWallet("100.00");
+    await getTestDataSource().query(`
+      CREATE OR REPLACE FUNCTION fail_test_outbox_insert()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.event_type IN ('WalletBalanceChanged', 'WagerTransactionRejected') THEN
+          RAISE EXCEPTION 'forced outbox insert failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+    `);
+    await getTestDataSource().query(`
+      CREATE TRIGGER trg_test_fail_outbox_insert
+      BEFORE INSERT ON outbox_messages
+      FOR EACH ROW EXECUTE FUNCTION fail_test_outbox_insert();
+    `);
+
+    const processedKey = "provider-a:outbox-processed-failure";
+    const rejectedKey = "provider-a:outbox-rejected-failure";
+
+    try {
+      const processedFailure = await submit(
+        processedKey,
+        requestBody(wallet, WagerTransactionKind.Bet, "42.42"),
+      );
+      expect(processedFailure.status).toBe(500);
+
+      const rejectionFailure = await submit(
+        rejectedKey,
+        requestBody(wallet, WagerTransactionKind.Bet, "101.00"),
+      );
+      expect(rejectionFailure.status).toBe(500);
+
+      const [transactions] = await getTestDataSource().query(
+        `SELECT count(*)::int AS count
+         FROM wager_transactions
+         WHERE idempotency_key IN ($1, $2)`,
+        [processedKey, rejectedKey],
+      );
+      expect(transactions.count).toBe(0);
+
+      const [walletState] = await getTestDataSource().query(
+        "SELECT balance, version FROM wallets WHERE id = $1",
+        [wallet.id],
+      );
+      expect(walletState).toEqual({ balance: "100.00", version: 1 });
+
+      expect(await countRows("wallet_ledger_entries", wallet.id)).toBe(1);
+      const [outboxRows] = await getTestDataSource().query(
+        `SELECT count(*)::int AS count
+         FROM outbox_messages
+         WHERE payload ->> 'walletId' = $1`,
+        [wallet.id],
+      );
+      expect(outboxRows.count).toBe(0);
+    } finally {
+      await getTestDataSource().query(
+        "DROP TRIGGER IF EXISTS trg_test_fail_outbox_insert ON outbox_messages",
+      );
+      await getTestDataSource().query(
+        "DROP FUNCTION IF EXISTS fail_test_outbox_insert()",
       );
     }
   });
