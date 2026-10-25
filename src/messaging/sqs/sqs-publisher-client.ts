@@ -1,5 +1,8 @@
 import {
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
   GetQueueUrlCommand,
+  ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
 } from "@aws-sdk/client-sqs";
@@ -9,6 +12,8 @@ export interface SqsPublisherConfig {
   endpoint?: string;
   queueName: string;
 }
+
+export interface SqsTransactionConsumerConfig extends SqsPublisherConfig {}
 
 export interface SqsMessageInput {
   QueueUrl: string;
@@ -23,18 +28,67 @@ export interface SqsPublisherClient {
   destroy(): void;
 }
 
+export interface SqsReceivedMessage {
+  body?: string;
+  receiptHandle?: string;
+  messageId?: string;
+  messageGroupId?: string;
+  approximateReceiveCount?: number;
+}
+
+export interface SqsConsumerClient {
+  getQueueUrl(queueName: string): Promise<string>;
+  receiveMessages(
+    queueUrl: string,
+    options: {
+      maxNumberOfMessages: number;
+      waitTimeSeconds: number;
+      visibilityTimeoutSeconds: number;
+    },
+    signal: AbortSignal,
+  ): Promise<SqsReceivedMessage[]>;
+  deleteMessage(queueUrl: string, receiptHandle: string): Promise<void>;
+  changeMessageVisibility(
+    queueUrl: string,
+    receiptHandle: string,
+    visibilityTimeoutSeconds: number,
+  ): Promise<void>;
+  destroy(): void;
+}
+
 export function readSqsPublisherConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): SqsPublisherConfig {
+  return readQueueConfig(
+    environment,
+    "SQS_WAGER_INTEGRATION_EVENTS_QUEUE",
+    "wager-integration-events.fifo",
+  );
+}
+
+export function readSqsTransactionConsumerConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): SqsTransactionConsumerConfig {
+  return readQueueConfig(
+    environment,
+    "SQS_WAGER_TRANSACTIONS_QUEUE",
+    "wager-transactions.fifo",
+  );
+}
+
+function readQueueConfig(
+  environment: NodeJS.ProcessEnv,
+  queueEnvironmentVariable: string,
+  defaultQueueName: string,
+): SqsPublisherConfig {
   const region = environment.AWS_REGION?.trim() || "us-east-1";
   const queueName =
-    environment.SQS_WAGER_INTEGRATION_EVENTS_QUEUE?.trim() ||
-    "wager-integration-events.fifo";
+    environment[queueEnvironmentVariable]?.trim() || defaultQueueName;
   const endpoint = environment.SQS_ENDPOINT?.trim() || undefined;
 
   if (!queueName.endsWith(".fifo")) {
     throw new Error(
-      "SQS_WAGER_INTEGRATION_EVENTS_QUEUE must name a FIFO queue ending in .fifo",
+      `${queueEnvironmentVariable} must name a FIFO queue ending in .fifo`,
     );
   }
 
@@ -60,19 +114,7 @@ export function readSqsPublisherConfig(
 export function createSqsPublisherClient(
   config: SqsPublisherConfig,
 ): SqsPublisherClient {
-  const client = new SQSClient({
-    region: config.region,
-    maxAttempts: 1,
-    ...(config.endpoint
-      ? {
-          endpoint: config.endpoint,
-          credentials: {
-            accessKeyId: "localstack",
-            secretAccessKey: "localstack",
-          },
-        }
-      : {}),
-  });
+  const client = createConfiguredSqsClient(config);
 
   return {
     async getQueueUrl(queueName) {
@@ -95,6 +137,103 @@ export function createSqsPublisherClient(
       client.destroy();
     },
   };
+}
+
+export function createSqsConsumerClient(
+  config: SqsPublisherConfig,
+): SqsConsumerClient {
+  const client = createConfiguredSqsClient(config);
+
+  return {
+    async getQueueUrl(queueName) {
+      const response = await client.send(
+        new GetQueueUrlCommand({ QueueName: queueName }),
+        { abortSignal: AbortSignal.timeout(15_000) },
+      );
+      if (!response.QueueUrl) {
+        throw new Error(`SQS did not return a URL for queue ${queueName}`);
+      }
+      return response.QueueUrl;
+    },
+    async receiveMessages(queueUrl, options, signal) {
+      const response = await client.send(
+        new ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: options.maxNumberOfMessages,
+          WaitTimeSeconds: options.waitTimeSeconds,
+          VisibilityTimeout: options.visibilityTimeoutSeconds,
+          MessageSystemAttributeNames: [
+            "ApproximateReceiveCount",
+            "MessageGroupId",
+          ],
+        }),
+        { abortSignal: signal },
+      );
+      return (response.Messages ?? []).map((message) => ({
+        ...(message.Body !== undefined ? { body: message.Body } : {}),
+        ...(message.ReceiptHandle !== undefined
+          ? { receiptHandle: message.ReceiptHandle }
+          : {}),
+        ...(message.MessageId !== undefined
+          ? { messageId: message.MessageId }
+          : {}),
+        ...(message.Attributes?.MessageGroupId !== undefined
+          ? { messageGroupId: message.Attributes.MessageGroupId }
+          : {}),
+        ...(Number.isInteger(
+          Number(message.Attributes?.ApproximateReceiveCount),
+        )
+          ? {
+              approximateReceiveCount: Number(
+                message.Attributes?.ApproximateReceiveCount,
+              ),
+            }
+          : {}),
+      }));
+    },
+    async deleteMessage(queueUrl, receiptHandle) {
+      await client.send(
+        new DeleteMessageCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: receiptHandle,
+        }),
+        { abortSignal: AbortSignal.timeout(15_000) },
+      );
+    },
+    async changeMessageVisibility(
+      queueUrl,
+      receiptHandle,
+      visibilityTimeoutSeconds,
+    ) {
+      await client.send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: receiptHandle,
+          VisibilityTimeout: visibilityTimeoutSeconds,
+        }),
+        { abortSignal: AbortSignal.timeout(15_000) },
+      );
+    },
+    destroy() {
+      client.destroy();
+    },
+  };
+}
+
+function createConfiguredSqsClient(config: SqsPublisherConfig): SQSClient {
+  return new SQSClient({
+    region: config.region,
+    maxAttempts: 1,
+    ...(config.endpoint
+      ? {
+          endpoint: config.endpoint,
+          credentials: {
+            accessKeyId: "localstack",
+            secretAccessKey: "localstack",
+          },
+        }
+      : {}),
+  });
 }
 
 export type SqsPublishErrorClassification =

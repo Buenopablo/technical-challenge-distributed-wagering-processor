@@ -17,12 +17,14 @@ As responsabilidades estão organizadas em:
   abertura e processamento financeiro, que coordenam domínio e persistência.
 - `src/application/outbox/`: reivindicação concorrente, reconstrução e
   publicação dos eventos persistidos na Outbox.
-- `src/messaging/sqs/`: configuração do cliente SQS do publisher.
+- `src/application/inbox/`: validação, Inbox transacional e polling das
+  requisições financeiras recebidas por SQS.
+- `src/messaging/sqs/`: configuração compartilhada de clientes SQS de
+  publicação e consumo.
 - `src/http/`: controller de `POST /wagering/transactions`, responsável pela
   validação de entrada e pelo mapeamento de erros para HTTP.
-- `src/messaging/contracts/`: contratos versionados e validação de mensagens
-  SQS de entrada e eventos de integração de saída; o consumidor e o
-  processamento transacional da Inbox ainda não estão implementados.
+- `src/messaging/contracts/`: contratos versionados e validação da mensagem
+  SQS de entrada e dos eventos de integração de saída.
 - `src/database/entities/`: mapeamento das tabelas PostgreSQL para TypeORM.
 - `src/database/migrations/`: criação versionada e reversível do schema.
 - `src/database/data-source.ts`: opções compartilhadas pela aplicação e pelos
@@ -233,9 +235,13 @@ parciais para eventos pendentes e claims expirados.
 `received_at` e `processed_at`. A chave primária composta por consumidor e
 mensagem impede duplicação para o mesmo consumidor sem impedir consumidores
 distintos de tratarem a mesma mensagem. `processed_at` é `NOT NULL` e recebe
-default de banco; a semântica pretendida é inserir essa linha dentro da mesma
-transação SQL que conclui a operação financeira. Ainda não existe código de
-consumidor nem esse processamento transacional.
+default do banco; o consumidor financeiro insere a linha, executa o caso de
+uso de aposta e atualiza `processed_at` dentro de uma transação PostgreSQL. O
+`message_id` guarda o `MessageId` de transporte retornado pelo SQS, não o
+`messageId` do envelope da aplicação. O hash SHA-256 é calculado sobre a
+mensagem validada com as chaves dos objetos ordenadas recursivamente; reuso do
+mesmo ID de transporte com outro hash é conflito de integridade e não é
+confirmado no SQS.
 
 `OutboxMessageEntity` mapeia o envelope do evento (`event_id`, tipo, versão,
 agregado, instante de ocorrência, causation/correlation IDs) e seu payload
@@ -299,57 +305,61 @@ PostgreSQL.
 ## Estado e evolução prevista
 
 Implementado: fundação Bun/NestJS/TypeScript estrito, TypeORM, PostgreSQL,
-migrations de wallet/OPENING/ledger e idempotência, `Money`, domínio de
-Wallet/`WagerTransaction`/ledger, casos de uso transacionais de abertura e
-processamento BET/WIN/LOSS, endpoint POST de transação, replay idempotente,
-bloqueio por carteira e testes unitários e de integração com PostgreSQL real.
+migrations de wallet/OPENING/ledger, idempotência e Inbox/Outbox, `Money`,
+domínio de Wallet/`WagerTransaction`/ledger, casos de uso transacionais de
+abertura e processamento BET/WIN/LOSS, endpoint POST de transação, replay
+idempotente, bloqueio por carteira, publisher Outbox e consumidor da fila
+financeira de entrada com Inbox idempotente.
 Os testes de concorrência também iniciam três instâncias NestJS independentes,
 com servidores e pools próprios, para verificar a serialização no PostgreSQL
 compartilhado. A migration de snapshots foi testada para recusar reversão
 quando há transações externas terminais e manter seus dados e sua aplicação.
 
 Ainda previsto: endpoint de abertura e endpoints de consulta; `REFUND` e
-`ROLLBACK`; referências pendentes; consumidor SQS, processamento transacional
-da Inbox, retries de consumo e tratamento da DLQ; reconciliação, health checks,
-observabilidade e autenticação opcional. O publisher Outbox é implementado
-abaixo. Os testes ainda não validam execução em três ou mais processos do
-sistema operacional para o publisher.
+`ROLLBACK`; referências pendentes; consumidor downstream para eventos de
+integração da Outbox; processamento operacional da DLQ, reconciliação, health
+checks, observabilidade e autenticação opcional. O consumidor financeiro
+compartilha a transação do caso de uso HTTP; o publisher Outbox e esse
+consumidor são processos independentes. Os testes ainda não validam execução
+em três ou mais processos do sistema operacional para o publisher.
 
 ## Preparação de SQS e contratos da etapa 4
 
-O README oficial determina AWS SQS via LocalStack ou MiniStack e pressupõe
-entrega `at-least-once`, reentrega, eventos duplicados e indisponibilidade
-temporária. Também define a estrutura conceitual de Inbox e Outbox e exige que
-Inbox, operação financeira, ledger e Outbox participem da mesma transação SQL.
-O enunciado não determina os nomes exatos das filas nem um envelope completo
-de entrada/saída; os nomes e esquemas abaixo são decisões desta implementação,
-não requisitos literais do README.
+O README oficial determina AWS SQS via LocalStack ou MiniStack e define a
+mensagem financeira de entrada `WagerTransactionRequested`. Ele pressupõe
+entrega `at-least-once`, redelivery, duplicatas e indisponibilidade temporária.
+Inbox, operação financeira, ledger e Outbox são confirmados na mesma
+transação. A Outbox alimenta uma fila de eventos de integração separada, sem
+consumidor downstream definido nesta etapa.
 
 O serviço LocalStack usa container próprio no Docker Compose e porta local
 `14566`, sem substituir nem compartilhar os recursos PostgreSQL do projeto.
 Os nomes vêm das variáveis `SQS_WAGER_TRANSACTIONS_QUEUE` e
 `SQS_WAGER_TRANSACTIONS_DLQ`, compartilhadas pelo serviço, script de
 provisionamento e healthcheck; os defaults são `wager-transactions.fifo` e
-`wager-transactions-dlq.fifo`. O provisionamento usa `create-queue` com os
-mesmos atributos, podendo ser repetido sem criar filas duplicadas. A fila de
-entrada tem redrive para a DLQ após cinco recebimentos sem confirmação. FIFO e
-deduplicação do broker serão otimizações de ordenação e tráfego, não a
-garantia de idempotência financeira.
+`wager-transactions-dlq.fifo`. O provisionamento cria as filas FIFO e configura redrive após cinco
+recebimentos sem confirmação para a fila financeira de entrada. A fila de
+eventos de saída tem uma DLQ exclusiva configurada por
+`SQS_WAGER_INTEGRATION_EVENTS_DLQ`, mas não é consumida por este serviço.
+FIFO e deduplicação do broker são otimizações, não substituem a idempotência
+persistente.
 
-A fila de saída `wager-integration-events.fifo` é provisionada separadamente
-por `SQS_WAGER_INTEGRATION_EVENTS_QUEUE`; não compartilha a DLQ da fila de
-entrada. O publisher usa `SQS_ENDPOINT` para LocalStack, `AWS_REGION` para a
-região, credenciais locais fictícias quando há endpoint customizado e a cadeia
-padrão do SDK para AWS.
+A fila de saída `wager-integration-events.fifo` é provisionada por
+`SQS_WAGER_INTEGRATION_EVENTS_QUEUE` e tem sua própria DLQ, sem compartilhar a
+DLQ da fila de entrada. O publisher e o consumidor usam `SQS_ENDPOINT` para
+LocalStack, `AWS_REGION` para a região, credenciais locais fictícias quando há
+endpoint customizado e a cadeia padrão do SDK para AWS.
 
-A mensagem de entrada proposta tem `messageVersion: 1`, `idempotencyKey` e
-`transaction`. O objeto de transação contém `providerId`,
-`externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`
-e `money`. A validação já implementada nesta subetapa aceita os tipos atuais
-`BET`, `WIN` e `LOSS`, valida identificadores e Money sem conversão monetária
-para `number`, e rejeita `OPENING`; `REFUND` e `ROLLBACK` ficam fora da etapa 4.
-O `messageId` de transporte virá dos atributos do SQS; não substitui a
-`idempotencyKey` de negócio.
+A mensagem de entrada segue o contrato `WagerTransactionRequested`: `messageId`,
+`type`, `occurredAt` e `data`, com `providerId`, `externalTransactionId`,
+`idempotencyKey`, `playerId`, `walletId`, `roundId`, `gameId`, `kind` e
+`money`. A validação implementada aceita os tipos atuais `BET`, `WIN` e
+`LOSS`, valida identificadores, timestamp UTC e Money sem conversão monetária
+para `number`, e rejeita `OPENING`; `REFUND` e `ROLLBACK` ficam fora da etapa
+atual. O `MessageId` atribuído pelo transporte SQS junto ao `consumerName` é
+a identidade da Inbox; `idempotencyKey` e o hash do payload de negócio
+continuam protegendo a idempotência financeira. O `messageId` do envelope
+permanece dado do contrato e não substitui o ID de transporte.
 
 Os eventos de saída definidos para operações atuais compartilham um envelope
 com `eventId` criado uma vez e persistido com o evento na Outbox,
@@ -443,6 +453,88 @@ O LocalStack recebe uma fila FIFO temporária exclusiva nos testes do publisher,
 junto a um banco PostgreSQL temporário. O processo de teste remove somente
 esses recursos que criou; não purga filas compartilhadas.
 
-Ainda não há consumidor SQS, processamento da Inbox, confirmação/ack de
-mensagens recebidas, retries de consumo ou tratamento operacional da DLQ de
-entrada. A dependência `@aws-sdk/client-sqs` é usada pelo publisher.
+### Consumidor financeiro SQS e Inbox
+
+`bun run inbox:consume` inicia um processo independente do servidor HTTP e do
+publisher Outbox. No bootstrap, valida a configuração do SQS e do polling,
+resolve a URL de `wager-transactions.fifo`, inicializa o DataSource e começa
+long polling. Tamanho do lote e concorrência são limitados; por padrão ambos
+são cinco, o long poll é de até 20 segundos e a visibilidade é de 30 segundos.
+As opções podem ser ajustadas pelas variáveis `SQS_CONSUMER_*`.
+
+O processor valida o envelope `WagerTransactionRequested`, calcula seu hash
+canônico SHA-256 e inicia uma transação PostgreSQL. Insere
+`(consumer_name, SQS MessageId, payload_hash)` na Inbox e então chama
+`ProcessWagerTransactionUseCase.executeInTransaction()` com o mesmo
+`EntityManager` fornecido à transação. O caso de uso financeiro é compartilhado
+com HTTP: não há segundo handler que duplique a lógica. A carteira, wager,
+ledger e eventos Outbox, quando aplicáveis, são persistidos nesse mesmo
+manager. O commit inclui a Inbox e todos os efeitos, ou o rollback remove
+todos. A chave composta da Inbox impede concorrência do mesmo ID de transporte
+para o consumidor; a chave financeira e o hash de negócio continuam sendo
+uma proteção separada para reenvios com outro `MessageId`.
+
+O `messageId` dentro do envelope é validado como dado de contrato, mas não
+substitui o `MessageId` atribuído pelo SQS como identidade da Inbox. Hashes
+idênticos para uma linha Inbox existente são redelivery já processada; o
+mesmo ID de transporte com conteúdo distinto é conflito de integridade e não
+é confirmado. Payloads inválidos também não são confirmados.
+
+O consumidor envia `DeleteMessage` apenas depois do commit PostgreSQL. Uma
+falha no ACK pode gerar redelivery, reconhecida pela Inbox sem repetir efeitos.
+Rejeições de negócio persistidas (por exemplo, saldo insuficiente) são
+terminais e confirmadas depois do commit. Conflito de `idempotencyKey` com
+payload de negócio diferente também é terminal e pode ser confirmado depois
+do commit da Inbox; nenhuma transação financeira conflitante é criada.
+Falhas transitórias reconhecidas do PostgreSQL recebem atraso exponencial
+curto por `ChangeMessageVisibility`. Erros desconhecidos, erros permanentes,
+carteira inexistente, conflito de integridade de Inbox e mensagem inválida não
+são confirmados e seguem a redrive policy da fila de entrada, após cinco
+recebimentos. A DLQ exige investigação e reprocessamento operacional, ainda
+não implementados. O enunciado não especifica a classificação de carteira
+inexistente. A decisão conservadora é não confirmar nem persistir Inbox ou
+resultado financeiro: a mensagem segue para a DLQ para inspeção e possível
+reprocessamento, evitando descartar uma operação que possa depender de ordem
+de criação da carteira. Erros de configuração global do SQS interrompem o
+processo em vez de serem tratados como falhas de negócio.
+
+O polling respeita grupos FIFO: mensagens recebidas com o mesmo
+`MessageGroupId` são processadas sequencialmente no lote, enquanto grupos
+distintos podem avançar em paralelo. Se uma mensagem não for confirmada, o
+restante do mesmo grupo é interrompido para esse lote; a redelivery é
+responsável por retomar a sequência. O contrato rejeita campos desconhecidos
+no envelope, em `data` e em `money`, impedindo que propriedades semânticas
+adicionais sejam ignoradas no hash de integridade.
+
+Assim que um lote é aceito, cada mensagem com receipt handle recebe um
+heartbeat, inclusive as que aguardam na fila local do grupo FIFO. O consumidor
+renova a visibilidade com `ChangeMessageVisibility` a cada metade do timeout
+configurado, estendendo-a pelo mesmo timeout durante a espera e o
+processamento. Mudanças de visibilidade e ACK são serializados por mensagem
+para evitar corridas entre `ChangeMessageVisibility` e `DeleteMessage`. O
+heartbeat é encerrado e aguardado após ACK, falha, interrupção do lote ou
+cancelamento; em falha transitória, ele para antes de aplicar o backoff de
+retry. Erros são registrados e não são considerados renovações bem-sucedidas.
+Erros não globais permitem nova tentativa no próximo intervalo; erro global
+de configuração interrompe o heartbeat e propaga a falha após a tarefa em
+curso. Se o SQS rejeitar a renovação ou estiver indisponível, a visibilidade
+vigente ainda pode expirar e causar redelivery ou redrive para DLQ. As
+garantias persistentes de Inbox e idempotência protegem os efeitos financeiros,
+mas não eliminam essa possibilidade durante indisponibilidade prolongada do
+SQS.
+
+SIGINT/SIGTERM interrompem novos polls, mas o heartbeat das mensagens em
+andamento continua até elas terminarem; o encerramento aguarda o trabalho e a
+parada de todas as renovações antes de fechar DataSource e cliente SQS. Após o
+prazo de grace, o processo registra o atraso e continua aguardando os recursos
+ativos. Se o processo for encerrado externamente, mensagens sem ACK podem ser
+redeliveradas com segurança.
+
+A fila de saída de eventos de integração não possui consumidor downstream
+ativo ou definido; nenhum processo deste projeto lê ou exclui suas mensagens.
+Sua DLQ configurada tampouco é monitorada nesta etapa. Testes do consumidor
+criam banco PostgreSQL, fila FIFO e DLQ temporários exclusivos. Eles cobrem
+commit atômico, rollback em falha, idempotência financeira separada da Inbox,
+rejeição terminal, redelivery após falha de ACK, retry de falha transitória,
+DLQ de mensagem inválida e encerramento do polling. `@aws-sdk/client-sqs` é
+compartilhado pelo publisher e pelo consumidor.

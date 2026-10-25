@@ -4,17 +4,17 @@ import {
   MoneyValidationError,
 } from "../../domain/money/money";
 
-export const WAGER_MESSAGE_VERSION = 1 as const;
-
+export const WAGER_TRANSACTION_REQUESTED_TYPE = "WagerTransactionRequested";
 export type WagerMessageKind = "BET" | "WIN" | "LOSS";
 
 export interface WagerTransactionMessage {
-  messageVersion: typeof WAGER_MESSAGE_VERSION;
-  idempotencyKey: string;
-  correlationId?: string;
-  transaction: {
+  messageId: string;
+  type: typeof WAGER_TRANSACTION_REQUESTED_TYPE;
+  occurredAt: string;
+  data: {
     providerId: string;
     externalTransactionId: string;
+    idempotencyKey: string;
     playerId: string;
     walletId: string;
     roundId: string;
@@ -33,6 +33,19 @@ export class InvalidWagerTransactionMessageError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  objectName: string,
+): void {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw new InvalidWagerTransactionMessageError(
+      `${objectName} contains unsupported field(s): ${unknown.join(", ")}`,
+    );
+  }
 }
 
 function requiredString(
@@ -59,8 +72,33 @@ function isUuid(value: string): boolean {
   );
 }
 
-function isWagerMessageKind(value: unknown): value is WagerMessageKind {
-  return value === "BET" || value === "WIN" || value === "LOSS";
+function parseOccurredAt(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value)
+  ) {
+    throw new InvalidWagerTransactionMessageError(
+      "occurredAt must be an ISO-8601 UTC timestamp",
+    );
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new InvalidWagerTransactionMessageError(
+      "occurredAt must be a valid ISO-8601 UTC timestamp",
+    );
+  }
+  const parts = value.match(
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/,
+  );
+  if (
+    !parts ||
+    date.toISOString() !== `${parts[1]}.${(parts[2] ?? "").padEnd(3, "0")}Z`
+  ) {
+    throw new InvalidWagerTransactionMessageError(
+      "occurredAt must be a valid ISO-8601 UTC timestamp",
+    );
+  }
+  return value;
 }
 
 export function parseWagerTransactionMessage(
@@ -71,53 +109,71 @@ export function parseWagerTransactionMessage(
       "Message must be a JSON object",
     );
   }
-  if (input.messageVersion !== WAGER_MESSAGE_VERSION) {
+  rejectUnknownFields(
+    input,
+    ["messageId", "type", "occurredAt", "data"],
+    "Message",
+  );
+  if (input.type !== WAGER_TRANSACTION_REQUESTED_TYPE) {
     throw new InvalidWagerTransactionMessageError(
-      `messageVersion must be ${WAGER_MESSAGE_VERSION}`,
+      `type must be ${WAGER_TRANSACTION_REQUESTED_TYPE}`,
     );
   }
-
-  const idempotencyKey = requiredString(input, "idempotencyKey", 255);
-  const correlationId =
-    input.correlationId === undefined
-      ? undefined
-      : requiredString(input, "correlationId", 255);
-
-  if (!isRecord(input.transaction)) {
+  if (!isRecord(input.data)) {
     throw new InvalidWagerTransactionMessageError(
-      "transaction must be a JSON object",
+      "data must be a JSON object",
     );
   }
-  const transaction = input.transaction;
-  const providerId = requiredString(transaction, "providerId", 128);
+  rejectUnknownFields(
+    input.data,
+    [
+      "providerId",
+      "externalTransactionId",
+      "idempotencyKey",
+      "playerId",
+      "walletId",
+      "roundId",
+      "gameId",
+      "kind",
+      "money",
+    ],
+    "data",
+  );
+
+  const messageId = requiredString(input, "messageId", 256);
+  const occurredAt = parseOccurredAt(input.occurredAt);
+  const data = input.data;
+  const providerId = requiredString(data, "providerId", 128);
   const externalTransactionId = requiredString(
-    transaction,
+    data,
     "externalTransactionId",
     255,
   );
-  const playerId = requiredString(transaction, "playerId", 36);
-  const walletId = requiredString(transaction, "walletId", 36);
-  const roundId = requiredString(transaction, "roundId", 255);
-  const gameId = requiredString(transaction, "gameId", 255);
+  const idempotencyKey = requiredString(data, "idempotencyKey", 255);
+  const playerId = requiredString(data, "playerId", 36);
+  const walletId = requiredString(data, "walletId", 36);
+  const roundId = requiredString(data, "roundId", 255);
+  const gameId = requiredString(data, "gameId", 255);
   if (!isUuid(playerId) || !isUuid(walletId)) {
     throw new InvalidWagerTransactionMessageError(
       "playerId and walletId must be UUIDs",
     );
   }
 
-  if (!isWagerMessageKind(transaction.kind)) {
+  const kind = data.kind;
+  if (kind !== "BET" && kind !== "WIN" && kind !== "LOSS") {
     throw new InvalidWagerTransactionMessageError(
       "kind must be BET, WIN, or LOSS in this processing stage",
     );
   }
-  if (!isRecord(transaction.money)) {
+  if (!isRecord(data.money)) {
     throw new InvalidWagerTransactionMessageError(
       "money must contain amount and currency",
     );
   }
-
-  const amount = transaction.money.amount;
-  const currency = transaction.money.currency;
+  rejectUnknownFields(data.money, ["amount", "currency"], "money");
+  const amount = data.money.amount;
+  const currency = data.money.currency;
   if (typeof amount !== "string" || typeof currency !== "string") {
     throw new InvalidWagerTransactionMessageError(
       "money.amount and money.currency must be strings",
@@ -135,17 +191,18 @@ export function parseWagerTransactionMessage(
   }
 
   return {
-    messageVersion: WAGER_MESSAGE_VERSION,
-    idempotencyKey,
-    ...(correlationId === undefined ? {} : { correlationId }),
-    transaction: {
+    messageId,
+    type: WAGER_TRANSACTION_REQUESTED_TYPE,
+    occurredAt,
+    data: {
       providerId,
       externalTransactionId,
+      idempotencyKey,
       playerId,
       walletId,
       roundId,
       gameId,
-      kind: transaction.kind,
+      kind,
       money,
     },
   };

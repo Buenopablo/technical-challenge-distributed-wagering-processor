@@ -1,16 +1,17 @@
 # Jungle Gaming Backend Challenge
 
 Backend em desenvolvimento para o desafio Distributed Wagering Processor da
-Jungle Gaming. Além da fundação NestJS/TypeORM e da abertura de carteiras, esta
-etapa implementa `POST /wagering/transactions` para `BET`, `WIN` e `LOSS`, com
-idempotência persistente e processamento transacional no PostgreSQL.
+Jungle Gaming. Além da fundação NestJS/TypeORM e da abertura de carteiras, o
+projeto implementa `POST /wagering/transactions` para `BET`, `WIN` e `LOSS`,
+Inbox/Outbox persistentes, um consumidor da fila financeira de entrada e um
+publisher independente dos eventos de integração de saída.
 
 Este projeto ainda não conclui o desafio. As operações BET/WIN/LOSS/REFUND/
 ROLLBACK não estão todas implementadas: `REFUND` e `ROLLBACK` continuam
-pendentes. Também faltam os endpoints de consulta, consumo SQS,
-processamento da Inbox, retries de consumo, reconciliação e observabilidade.
-Eventos financeiros já são persistidos transacionalmente na Outbox e um
-publisher independente os envia para uma fila SQS FIFO.
+pendentes. Também faltam os endpoints de consulta, processamento operacional
+da DLQ, reconciliação e observabilidade. As requisições financeiras SQS usam
+o mesmo caso de uso HTTP, com Inbox, efeitos financeiros, ledger e Outbox na
+mesma transação PostgreSQL.
 
 ## Pré-requisitos
 
@@ -38,11 +39,15 @@ O LocalStack deste projeto usa container exclusivo e expõe SQS somente em
 `SQS_WAGER_TRANSACTIONS_QUEUE` e `SQS_WAGER_TRANSACTIONS_DLQ`, com defaults
 `wager-transactions.fifo` e `wager-transactions-dlq.fifo`. O script de
 provisionamento e o healthcheck usam essas mesmas variáveis. A fila principal
-tem redrive para a DLQ após cinco recebimentos sem confirmação. O Compose não
-remove nem modifica outros containers ou bancos.
+tem redrive para a DLQ após cinco recebimentos sem confirmação. A fila de
+eventos de saída tem uma DLQ exclusiva própria, também após cinco recebimentos
+sem confirmação. O Compose não remove nem modifica outros containers ou bancos.
 
 A fila de eventos de saída é independente: `SQS_WAGER_INTEGRATION_EVENTS_QUEUE`
-tem default `wager-integration-events.fifo` e não usa a DLQ da fila de entrada.
+tem default `wager-integration-events.fifo` e publica os eventos da Outbox.
+Ela não possui consumidor downstream ativo nesta etapa. Usa
+`SQS_WAGER_INTEGRATION_EVENTS_DLQ` (default
+`wager-integration-events-dlq.fifo`), separada da DLQ da fila de entrada.
 O publisher usa `SQS_ENDPOINT` quando configurado, `AWS_REGION` e essa variável
 de fila. Para LocalStack, o SDK recebe credenciais fictícias locais; sem
 endpoint customizado, usa a cadeia padrão de credenciais AWS. Não inclua
@@ -50,23 +55,25 @@ credenciais reais no repositório ou em `.env.example`.
 
 O schema de `inbox_messages` e `outbox_messages` é preparado por migration.
 O fluxo HTTP financeiro grava eventos em `outbox_messages` na mesma transação
-SQL; a tabela Inbox ainda não é usada por um consumidor.
+SQL. O consumidor da fila de entrada registra o `MessageId` atribuído pelo
+SQS e o hash do envelope validado na Inbox, e chama o mesmo caso de uso
+financeiro do endpoint HTTP usando o mesmo `EntityManager`. Assim, a Inbox,
+a carteira, a transação financeira, o ledger e os novos eventos Outbox
+confirmam ou revertem juntos. A chave de idempotência financeira e seu hash
+de payload continuam independentes da identidade da Inbox.
 
-## Contratos de mensageria definidos para a etapa seguinte
+## Contratos de mensageria
 
-O README oficial exige AWS SQS por LocalStack ou MiniStack e assume entrega
-`at-least-once`, com duplicatas, reentregas, múltiplas instâncias e falhas
-temporárias. Ele também exige Inbox/Outbox persistentes e atomicidade SQL, mas
-não fixa nomes de filas nem um envelope completo de mensagens/eventos.
-
-Como decisão deste projeto, a mensagem de entrada usa `messageVersion: 1`,
-`idempotencyKey` e um objeto `transaction` com os campos financeiros e de
-identidade do contrato HTTP. `BET`, `WIN` e `LOSS` são os tipos previstos para
-processamento nesta etapa; `OPENING` nunca é aceito como mensagem externa.
-`REFUND` e `ROLLBACK` permanecem para a etapa 5. Valores monetários são strings
-decimais validadas por `Money`; `playerId` e `walletId` são UUIDs. O
-`messageId` da Inbox será o identificador atribuído pelo SQS, distinto da
-chave de idempotência de negócio.
+O README oficial define a fila financeira FIFO `wager-transactions.fifo` e o
+envelope `WagerTransactionRequested`, além de exigir processamento seguro sob
+duplicatas e falhas. A mensagem de entrada contém `messageId`, `type`,
+`occurredAt` e `data`, com `providerId`, `externalTransactionId`,
+`idempotencyKey`, `playerId`, `walletId`, `roundId`, `gameId`, `kind` e
+`money`. `BET`, `WIN` e `LOSS` são aceitos nesta etapa; `OPENING` é interno, e
+`REFUND`/`ROLLBACK` ainda não são processados. Valores monetários são strings
+decimais validadas por `Money`; `playerId` e `walletId` são UUIDs. A Inbox usa
+o `MessageId` do transporte SQS junto ao `consumerName`, enquanto a
+idempotência financeira usa a `idempotencyKey` e o hash do payload de negócio.
 
 Os eventos de saída usam envelope versionado (`eventVersion: 1`) com `eventId`
 estável persistido na Outbox junto ao evento,
@@ -89,8 +96,11 @@ timestamp UTC válido, consistência de moeda e relação entre agregado e walle
 Em `WagerTransactionRejected`, a moeda de `money` pode diferir da moeda de
 `resultBalance` quando a rejeição ocorre por incompatibilidade de moeda; os
 eventos de sucesso e de alteração de saldo exigem coerência de moeda.
-O publisher de saída está implementado e pode ser executado separadamente; o
-consumidor SQS e o processamento transacional da Inbox continuam pendentes.
+O consumidor de entrada e o publisher de saída são processos independentes.
+O consumidor processa a operação financeira e confirma no SQS somente após o
+commit. A Outbox publica eventos de integração, mas não há consumidor
+downstream para essa fila nesta etapa; portanto, nenhum processo lê ou exclui
+essas mensagens.
 
 ## Banco de dados e migrations
 
@@ -121,9 +131,8 @@ proteção apagando transações.
 A migration `CreateInboxAndOutbox` cria as tabelas de Inbox e Outbox. Sua
 reversão bloqueia as tabelas e verifica primeiro se qualquer uma contém
 linhas; se houver dados, aborta com erro antes de remover tabelas ou registros.
-`processed_at` é obrigatório porque o modelo previsto insere a linha Inbox na
-mesma transação SQL que conclui o processamento financeiro; esse fluxo ainda
-não está implementado. A Outbox recebe eventos do processamento HTTP na mesma
+`processed_at` é obrigatório porque a linha Inbox e o processamento financeiro
+confirmam na mesma transação SQL do consumidor. A Outbox recebe eventos do processamento HTTP na mesma
 transação financeira. A migration aditiva `AddOutboxFailureState` adiciona
 `failed_at` e `last_error` para falhas terminais do publisher. Sua reversão
 bloqueia a tabela e aborta antes de remover colunas se houver diagnóstico de
@@ -194,9 +203,68 @@ operacional.
 SIGINT/SIGTERM impedem novos ciclos e aguardam o lote em curso; claims ainda não
 concluídos permanecem recuperáveis por expiração.
 
-O consumidor SQS, o processamento transacional da Inbox e os retries de
-consumo continuam pendentes. A DLQ provisionada pertence à fila de entrada e
-não participa do retry do publisher Outbox.
+Com PostgreSQL, LocalStack, fila provisionada e migrations aplicadas, inicie o
+consumidor financeiro independente com `bun run inbox:consume`. Ele valida a
+mensagem `WagerTransactionRequested`, registra na Inbox a identidade
+`(consumerName, SQS MessageId)` e o hash SHA-256 canônico, então chama
+`ProcessWagerTransactionUseCase.executeInTransaction()` com o mesmo
+`EntityManager`. A Inbox, os efeitos financeiros, o ledger e a Outbox ficam
+na mesma transação PostgreSQL. O `DeleteMessage` ocorre somente depois do
+commit confirmado. Se a confirmação SQS falhar, a redelivery encontra a Inbox
+já processada e não repete os efeitos; a idempotência financeira por
+`idempotencyKey` protege também mensagens SQS distintas para a mesma operação.
+Essas garantias oferecem processamento idempotente com entrega
+at-least-once, não exactly-once.
+
+Rejeições de negócio persistidas, como saldo insuficiente, são terminais e
+confirmadas após o commit. Conflito da chave financeira com payload diferente
+é tratado como terminal, com Inbox confirmada para evitar retries inúteis.
+Falhas transitórias reconhecidas do PostgreSQL recebem atraso exponencial
+curto por `ChangeMessageVisibility`; erros desconhecidos, falhas permanentes e
+mensagens inválidas não são confirmados e seguem a política de redrive da fila
+de entrada (cinco recebimentos até a DLQ). Erro permanente referente a carteira
+inexistente também é deixado para redrive/DLQ. O README oficial não classifica
+explicitamente uma carteira ausente; por segurança, o consumidor não confirma
+nem grava Inbox/resultado financeiro, preservando a mensagem na DLQ para
+inspeção e eventual reprocessamento em vez de descartar uma operação que possa
+depender da ordem de criação da carteira. A DLQ requer investigação e
+reprocessamento operacional, não implementados.
+
+O consumidor processa mensagens do mesmo `MessageGroupId` sequencialmente
+dentro do lote. Se uma mensagem não for confirmada (incluindo falha de
+processamento ou de `DeleteMessage`), as seguintes desse grupo não avançam
+naquele lote; grupos distintos continuam em paralelo. O envelope rejeita
+campos desconhecidos em todos os níveis, para que conteúdo extra não seja
+ignorado durante o cálculo do hash de integridade.
+
+Assim que um lote é aceito, o consumidor inicia um heartbeat para cada
+mensagem com receipt handle, inclusive as que aguardam sua vez atrás de uma
+mensagem anterior do mesmo grupo FIFO. A visibilidade é renovada
+periodicamente para o timeout configurado, em intervalos de metade desse
+timeout, ao longo da espera local e do processamento. As operações de mudança
+de visibilidade e ACK são serializadas por mensagem para evitar uma corrida
+entre `ChangeMessageVisibility` e `DeleteMessage`; o heartbeat é encerrado e
+aguardado após ACK, falha, interrupção do lote ou cancelamento. Em falha
+transitória, ele para antes de definir o backoff de redelivery. Erros de
+renovação são registrados e não são tratados como extensão bem-sucedida; novas
+tentativas ocorrem no próximo intervalo, exceto para erros globais de
+configuração, que interrompem a renovação. Se o SQS não aceitar as renovações,
+a visibilidade vigente pode expirar e permitir redelivery; Inbox e
+idempotência financeira mantêm os efeitos seguros, mas nenhum consumidor pode
+garantir evitar redelivery ou DLQ durante uma indisponibilidade prolongada do
+SQS.
+
+SIGINT/SIGTERM interrompem novos polls e aguardam as mensagens em andamento
+antes de fechar DataSource e cliente SQS. Se o prazo de encerramento expirar,
+o processo continua aguardando o trabalho ativo antes de fechar recursos; caso
+o processo seja encerrado externamente, mensagens não confirmadas podem ser
+redeliveradas com segurança.
+
+O publisher Outbox continua independente. Ele publica na fila de eventos de
+integração; nenhum consumidor downstream dessa fila está ativo ou definido,
+portanto as mensagens de saída não são lidas nem excluídas por esta aplicação.
+A DLQ configurada para a fila de saída também não é monitorada por um
+consumidor nesta etapa.
 
 ## Verificações e execução
 
@@ -211,18 +279,21 @@ bun run build            # build TypeScript de produção
 bun run start            # inicia a aplicação
 bun run start:dev        # inicia com Bun watch
 bun run outbox:publish   # inicia apenas o publisher da Outbox
+bun run inbox:consume    # inicia apenas o consumidor financeiro da fila SQS
 ```
 
 Os testes de integração conectam-se ao PostgreSQL configurado, criam um banco
 temporário com nome único, aplicam migrations e removem somente esse banco ao
 final. O usuário configurado precisa poder criar e remover databases. O teste
-do publisher também requer o LocalStack do projeto; cria uma fila FIFO
-temporária exclusiva e a remove ao final, sem purgar filas existentes. Os
-testes não limpam nem usam como banco de teste o banco de desenvolvimento.
-Execute o teste direcionado com:
+do publisher requer o LocalStack do projeto e cria uma fila FIFO temporária
+exclusiva. Os testes do consumidor financeiro também requerem o LocalStack, criam uma
+fila FIFO e uma DLQ temporárias exclusivas e as removem ao final. Nenhum teste
+purga filas compartilhadas; os testes não limpam nem usam como banco de teste
+o banco de desenvolvimento. Execute os testes direcionados com:
 
 ```sh
 bun test test/integration/outbox-publisher.test.ts
+bun test test/integration/wager-transaction-consumer.test.ts
 ```
 
 ## Fluxo implementado: abertura de carteira
@@ -329,11 +400,12 @@ resultado; falhas inesperadas não deixam uma transação parcial persistida.
   ainda não têm fluxo financeiro.
 - Ainda não há endpoints para criar ou consultar carteiras, transações,
   ledger ou reconciliação.
-- A idempotência persistente e o bloqueio por carteira são implementados para
-  o endpoint desta etapa; a gravação transacional de eventos na Outbox também
-  está implementada, assim como o publisher da Outbox para uma fila FIFO de
-  saída. Consumidor SQS, Inbox transacional, retries de consumo, processamento
-  da DLQ e referências pendentes ainda não.
+- A idempotência persistente, o bloqueio por carteira e o processamento
+  financeiro da fila de entrada são implementados. Inbox, caso de uso
+  financeiro, ledger e Outbox compartilham a transação. O publisher Outbox
+  envia eventos para a fila FIFO de saída, mas ainda não há consumidor
+  downstream; processamento operacional de DLQ e reprocessamento continuam
+  pendentes.
 - Ainda não há autenticação, health checks, métricas ou logs estruturados.
 
 Os próximos passos devem seguir o escopo oficial do desafio e acrescentar

@@ -110,234 +110,241 @@ export class ProcessWagerTransactionUseCase {
   async execute(
     input: ProcessWagerTransactionInput,
   ): Promise<ProcessWagerTransactionResult> {
+    return this.dataSource.transaction((manager) =>
+      this.executeInTransaction(input, manager),
+    );
+  }
+
+  async executeInTransaction(
+    input: ProcessWagerTransactionInput,
+    manager: EntityManager,
+  ): Promise<ProcessWagerTransactionResult> {
     const money = Money.from(input.money);
     const payloadHash = hashWagerPayload(input);
 
-    return this.dataSource.transaction(async (manager) => {
-      const existing = await this.findByIdempotencyKey(
+    const existing = await this.findByIdempotencyKey(
+      manager,
+      input.idempotencyKey,
+    );
+    if (existing) {
+      return this.replayOrConflict(existing, payloadHash);
+    }
+
+    const walletRows = (await manager.query(
+      `SELECT id, player_id, currency, balance, version, created_at, updated_at
+       FROM wallets
+       WHERE id = $1
+       FOR UPDATE`,
+      [input.walletId],
+    )) as LockedWalletRow[];
+    const walletRow = walletRows[0];
+    if (!walletRow) {
+      throw new WagerWalletNotFoundError();
+    }
+
+    const wallet = Wallet.rehydrate({
+      id: walletRow.id,
+      playerId: walletRow.player_id,
+      currency: walletRow.currency,
+      balance: { amount: walletRow.balance, currency: walletRow.currency },
+      version: walletRow.version,
+      createdAt: walletRow.created_at,
+      updatedAt: walletRow.updated_at,
+    });
+    const at = new Date();
+    const transaction = WagerTransaction.createExternal({
+      id: randomUUID(),
+      providerId: input.providerId,
+      externalTransactionId: input.externalTransactionId,
+      idempotencyKey: input.idempotencyKey,
+      payloadHash,
+      walletId: input.walletId,
+      playerId: input.playerId,
+      roundId: input.roundId,
+      gameId: input.gameId,
+      kind: input.kind,
+      money,
+      createdAt: at,
+    });
+
+    const insertedRows = (await manager.query(
+      `INSERT INTO wager_transactions (
+         id, provider_id, external_transaction_id, idempotency_key,
+         payload_hash, wallet_id, player_id, round_id, game_id, kind,
+         amount, currency, status, created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING id`,
+      [
+        transaction.id,
+        transaction.providerId,
+        transaction.externalTransactionId,
+        transaction.idempotencyKey,
+        transaction.payloadHash,
+        transaction.walletId,
+        transaction.playerId,
+        transaction.roundId,
+        transaction.gameId,
+        transaction.kind,
+        transaction.money.toString(),
+        transaction.money.currency,
+        WagerTransactionStatus.Pending,
+        transaction.createdAt,
+      ],
+    )) as Array<{ id: string }>;
+
+    if (insertedRows.length === 0) {
+      const concurrentExisting = await this.findByIdempotencyKey(
         manager,
         input.idempotencyKey,
       );
-      if (existing) {
-        return this.replayOrConflict(existing, payloadHash);
-      }
-
-      const walletRows = (await manager.query(
-        `SELECT id, player_id, currency, balance, version, created_at, updated_at
-         FROM wallets
-         WHERE id = $1
-         FOR UPDATE`,
-        [input.walletId],
-      )) as LockedWalletRow[];
-      const walletRow = walletRows[0];
-      if (!walletRow) {
-        throw new WagerWalletNotFoundError();
-      }
-
-      const wallet = Wallet.rehydrate({
-        id: walletRow.id,
-        playerId: walletRow.player_id,
-        currency: walletRow.currency,
-        balance: { amount: walletRow.balance, currency: walletRow.currency },
-        version: walletRow.version,
-        createdAt: walletRow.created_at,
-        updatedAt: walletRow.updated_at,
-      });
-      const at = new Date();
-      const transaction = WagerTransaction.createExternal({
-        id: randomUUID(),
-        providerId: input.providerId,
-        externalTransactionId: input.externalTransactionId,
-        idempotencyKey: input.idempotencyKey,
-        payloadHash,
-        walletId: input.walletId,
-        playerId: input.playerId,
-        roundId: input.roundId,
-        gameId: input.gameId,
-        kind: input.kind,
-        money,
-        createdAt: at,
-      });
-
-      const insertedRows = (await manager.query(
-        `INSERT INTO wager_transactions (
-           id, provider_id, external_transaction_id, idempotency_key,
-           payload_hash, wallet_id, player_id, round_id, game_id, kind,
-           amount, currency, status, created_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-         ON CONFLICT (idempotency_key) DO NOTHING
-         RETURNING id`,
-        [
-          transaction.id,
-          transaction.providerId,
-          transaction.externalTransactionId,
-          transaction.idempotencyKey,
-          transaction.payloadHash,
-          transaction.walletId,
-          transaction.playerId,
-          transaction.roundId,
-          transaction.gameId,
-          transaction.kind,
-          transaction.money.toString(),
-          transaction.money.currency,
-          WagerTransactionStatus.Pending,
-          transaction.createdAt,
-        ],
-      )) as Array<{ id: string }>;
-
-      if (insertedRows.length === 0) {
-        const concurrentExisting = await this.findByIdempotencyKey(
-          manager,
-          input.idempotencyKey,
+      if (!concurrentExisting) {
+        throw new Error(
+          "Idempotency conflict occurred but the persisted transaction was not found",
         );
-        if (!concurrentExisting) {
-          throw new Error(
-            "Idempotency conflict occurred but the persisted transaction was not found",
-          );
-        }
-        return this.replayOrConflict(concurrentExisting, payloadHash);
       }
+      return this.replayOrConflict(concurrentExisting, payloadHash);
+    }
 
-      let failureCode: string | undefined;
-      let ledgerEntry: WalletLedgerEntry | undefined;
-      let balanceChanged = false;
+    let failureCode: string | undefined;
+    let ledgerEntry: WalletLedgerEntry | undefined;
+    let balanceChanged = false;
 
-      if (wallet.playerId !== input.playerId) {
-        failureCode = "WALLET_PLAYER_MISMATCH";
-      } else if (wallet.currency !== money.currency) {
-        failureCode = "WALLET_CURRENCY_MISMATCH";
-      } else if (input.kind === WagerTransactionKind.Bet) {
-        try {
-          const change = wallet.debit(money, at);
-          balanceChanged = change.changed;
-          if (change.changed) {
-            ledgerEntry = WalletLedgerEntry.create({
-              id: randomUUID(),
-              walletId: wallet.id,
-              transactionId: transaction.id,
-              direction: LedgerDirection.Debit,
-              money,
-              balanceBefore: change.balanceBefore,
-              balanceAfter: change.balanceAfter,
-              createdAt: at,
-            });
-          }
-        } catch (error) {
-          if (!(error instanceof InsufficientWalletBalanceError)) {
-            throw error;
-          }
-          failureCode = "INSUFFICIENT_FUNDS";
-        }
-      } else if (input.kind === WagerTransactionKind.Win) {
-        const change = wallet.credit(money, at);
+    if (wallet.playerId !== input.playerId) {
+      failureCode = "WALLET_PLAYER_MISMATCH";
+    } else if (wallet.currency !== money.currency) {
+      failureCode = "WALLET_CURRENCY_MISMATCH";
+    } else if (input.kind === WagerTransactionKind.Bet) {
+      try {
+        const change = wallet.debit(money, at);
         balanceChanged = change.changed;
         if (change.changed) {
           ledgerEntry = WalletLedgerEntry.create({
             id: randomUUID(),
             walletId: wallet.id,
             transactionId: transaction.id,
-            direction: LedgerDirection.Credit,
+            direction: LedgerDirection.Debit,
             money,
             balanceBefore: change.balanceBefore,
             balanceAfter: change.balanceAfter,
             createdAt: at,
           });
         }
+      } catch (error) {
+        if (!(error instanceof InsufficientWalletBalanceError)) {
+          throw error;
+        }
+        failureCode = "INSUFFICIENT_FUNDS";
       }
-
-      if (failureCode) {
-        transaction.reject(failureCode);
-      } else {
-        transaction.markProcessed(at);
-      }
-
-      if (balanceChanged) {
-        await manager.update(
-          WalletEntity,
-          { id: wallet.id },
-          {
-            balance: wallet.balance.toString(),
-            version: wallet.version,
-            updatedAt: wallet.updatedAt,
-          },
-        );
-      }
-
-      if (ledgerEntry) {
-        const entity = manager.create(WalletLedgerEntryEntity, {
-          id: ledgerEntry.id,
-          walletId: ledgerEntry.walletId,
-          transactionId: ledgerEntry.transactionId,
-          direction: ledgerEntry.direction,
-          amount: ledgerEntry.money.toString(),
-          currency: ledgerEntry.money.currency,
-          balanceBefore: ledgerEntry.balanceBefore.toString(),
-          balanceAfter: ledgerEntry.balanceAfter.toString(),
-          createdAt: ledgerEntry.createdAt,
+    } else if (input.kind === WagerTransactionKind.Win) {
+      const change = wallet.credit(money, at);
+      balanceChanged = change.changed;
+      if (change.changed) {
+        ledgerEntry = WalletLedgerEntry.create({
+          id: randomUUID(),
+          walletId: wallet.id,
+          transactionId: transaction.id,
+          direction: LedgerDirection.Credit,
+          money,
+          balanceBefore: change.balanceBefore,
+          balanceAfter: change.balanceAfter,
+          createdAt: at,
         });
-        await manager.save(entity);
       }
+    }
 
+    if (failureCode) {
+      transaction.reject(failureCode);
+    } else {
+      transaction.markProcessed(at);
+    }
+
+    if (balanceChanged) {
       await manager.update(
-        WagerTransactionEntity,
-        { id: transaction.id },
+        WalletEntity,
+        { id: wallet.id },
         {
-          status: transaction.status,
-          processedAt: transaction.processedAt ?? null,
-          failureCode: transaction.failureCode ?? null,
-          resultBalance: wallet.balance.toString(),
-          resultCurrency: wallet.currency,
+          balance: wallet.balance.toString(),
+          version: wallet.version,
+          updatedAt: wallet.updatedAt,
         },
       );
+    }
 
-      const events = createWagerIntegrationEvents({
-        transactionId: transaction.id,
-        providerId: input.providerId,
-        externalTransactionId: input.externalTransactionId,
-        playerId: input.playerId,
-        walletId: input.walletId,
-        roundId: input.roundId,
-        gameId: input.gameId,
-        kind: input.kind,
-        money: money.toJSON(),
-        resultBalance: wallet.balance.toJSON(),
-        ...(ledgerEntry
-          ? { previousBalance: ledgerEntry.balanceBefore.toJSON() }
-          : {}),
-        occurredAt: at,
-        result: failureCode
-          ? { status: "REJECTED", failureCode }
-          : { status: "PROCESSED" },
+    if (ledgerEntry) {
+      const entity = manager.create(WalletLedgerEntryEntity, {
+        id: ledgerEntry.id,
+        walletId: ledgerEntry.walletId,
+        transactionId: ledgerEntry.transactionId,
+        direction: ledgerEntry.direction,
+        amount: ledgerEntry.money.toString(),
+        currency: ledgerEntry.money.currency,
+        balanceBefore: ledgerEntry.balanceBefore.toString(),
+        balanceAfter: ledgerEntry.balanceAfter.toString(),
+        createdAt: ledgerEntry.createdAt,
       });
+      await manager.save(entity);
+    }
 
-      for (const event of events) {
-        const outboxEntity = manager.create(OutboxMessageEntity, {
-          eventId: event.eventId,
-          eventType: event.eventType,
-          eventVersion: event.eventVersion,
-          aggregateId: event.aggregateId,
-          payload: event.payload,
-          occurredAt: new Date(event.occurredAt),
-          causationId: event.causationId ?? null,
-          correlationId: event.correlationId ?? null,
-        });
-        await manager.save(OutboxMessageEntity, outboxEntity);
-      }
+    await manager.update(
+      WagerTransactionEntity,
+      { id: transaction.id },
+      {
+        status: transaction.status,
+        processedAt: transaction.processedAt ?? null,
+        failureCode: transaction.failureCode ?? null,
+        resultBalance: wallet.balance.toString(),
+        resultCurrency: wallet.currency,
+      },
+    );
 
-      return {
-        transactionId: transaction.id,
-        status:
-          transaction.status === WagerTransactionStatus.Rejected
-            ? WagerTransactionStatus.Rejected
-            : WagerTransactionStatus.Processed,
-        balance: wallet.balance.toJSON(),
-        idempotentReplay: false,
-        ...(transaction.failureCode
-          ? { failureCode: transaction.failureCode }
-          : {}),
-      };
+    const events = createWagerIntegrationEvents({
+      transactionId: transaction.id,
+      providerId: input.providerId,
+      externalTransactionId: input.externalTransactionId,
+      playerId: input.playerId,
+      walletId: input.walletId,
+      roundId: input.roundId,
+      gameId: input.gameId,
+      kind: input.kind,
+      money: money.toJSON(),
+      resultBalance: wallet.balance.toJSON(),
+      ...(ledgerEntry
+        ? { previousBalance: ledgerEntry.balanceBefore.toJSON() }
+        : {}),
+      occurredAt: at,
+      result: failureCode
+        ? { status: "REJECTED", failureCode }
+        : { status: "PROCESSED" },
     });
+
+    for (const event of events) {
+      const outboxEntity = manager.create(OutboxMessageEntity, {
+        eventId: event.eventId,
+        eventType: event.eventType,
+        eventVersion: event.eventVersion,
+        aggregateId: event.aggregateId,
+        payload: event.payload,
+        occurredAt: new Date(event.occurredAt),
+        causationId: event.causationId ?? null,
+        correlationId: event.correlationId ?? null,
+      });
+      await manager.save(OutboxMessageEntity, outboxEntity);
+    }
+
+    return {
+      transactionId: transaction.id,
+      status:
+        transaction.status === WagerTransactionStatus.Rejected
+          ? WagerTransactionStatus.Rejected
+          : WagerTransactionStatus.Processed,
+      balance: wallet.balance.toJSON(),
+      idempotentReplay: false,
+      ...(transaction.failureCode
+        ? { failureCode: transaction.failureCode }
+        : {}),
+    };
   }
 
   private async findByIdempotencyKey(

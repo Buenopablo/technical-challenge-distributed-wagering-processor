@@ -29,6 +29,7 @@ services:
       SQS_WAGER_TRANSACTIONS_QUEUE: ${SQS_WAGER_TRANSACTIONS_QUEUE:-wager-transactions.fifo}
       SQS_WAGER_TRANSACTIONS_DLQ: ${SQS_WAGER_TRANSACTIONS_DLQ:-wager-transactions-dlq.fifo}
       SQS_WAGER_INTEGRATION_EVENTS_QUEUE: ${SQS_WAGER_INTEGRATION_EVENTS_QUEUE:-wager-integration-events.fifo}
+      SQS_WAGER_INTEGRATION_EVENTS_DLQ: ${SQS_WAGER_INTEGRATION_EVENTS_DLQ:-wager-integration-events-dlq.fifo}
       EAGER_SERVICE_LOADING: "1"
     ports:
       - "127.0.0.1:14566:4566"
@@ -40,7 +41,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_TRANSACTIONS_QUEUE}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_INTEGRATION_EVENTS_QUEUE}\" >/dev/null 2>&1",
+          "awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_TRANSACTIONS_QUEUE}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_TRANSACTIONS_DLQ}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_INTEGRATION_EVENTS_QUEUE}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_WAGER_INTEGRATION_EVENTS_DLQ}\" >/dev/null 2>&1",
         ]
       interval: 5s
       timeout: 5s

@@ -13,12 +13,13 @@ import {
 } from "../../src/messaging/contracts/integration-event";
 
 const validMessage = {
-  messageVersion: 1,
-  idempotencyKey: "provider-a:transaction-123",
-  correlationId: "request-123",
-  transaction: {
+  messageId: "request-123",
+  type: "WagerTransactionRequested",
+  occurredAt: "2026-10-24T20:00:00.000Z",
+  data: {
     providerId: "provider-a",
     externalTransactionId: "transaction-123",
+    idempotencyKey: "provider-a:transaction-123",
     playerId: "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
     walletId: "0192f291-27dd-7d3f-8071-5f8685deef37",
     roundId: "round-987",
@@ -76,18 +77,48 @@ const balanceChangedEvent = {
 } satisfies WalletBalanceChangedEvent;
 
 describe("SQS wager message contract", () => {
-  test("parses the versioned contract and normalizes Money exactly", () => {
+  test("parses the official request envelope and normalizes Money exactly", () => {
     expect(parseWagerTransactionMessage(validMessage)).toEqual(validMessage);
   });
 
-  test("rejects unsupported message versions and wager kinds", () => {
+  test("rejects unsupported types, invalid timestamps, and wager kinds", () => {
     expect(() =>
-      parseWagerTransactionMessage({ ...validMessage, messageVersion: 2 }),
+      parseWagerTransactionMessage({ ...validMessage, type: "Unknown" }),
     ).toThrow(InvalidWagerTransactionMessageError);
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: { ...validMessage.transaction, kind: "OPENING" },
+        occurredAt: "2026-02-30T20:00:00.000Z",
+      }),
+    ).toThrow(InvalidWagerTransactionMessageError);
+    expect(() =>
+      parseWagerTransactionMessage({
+        ...validMessage,
+        data: { ...validMessage.data, kind: "OPENING" },
+      }),
+    ).toThrow(InvalidWagerTransactionMessageError);
+  });
+
+  test("rejects unknown fields at every contract level", () => {
+    expect(() =>
+      parseWagerTransactionMessage({
+        ...validMessage,
+        extra: "not part of the contract",
+      }),
+    ).toThrow(InvalidWagerTransactionMessageError);
+    expect(() =>
+      parseWagerTransactionMessage({
+        ...validMessage,
+        data: { ...validMessage.data, extra: true },
+      }),
+    ).toThrow(InvalidWagerTransactionMessageError);
+    expect(() =>
+      parseWagerTransactionMessage({
+        ...validMessage,
+        data: {
+          ...validMessage.data,
+          money: { ...validMessage.data.money, precision: 2 },
+        },
       }),
     ).toThrow(InvalidWagerTransactionMessageError);
   });
@@ -96,14 +127,14 @@ describe("SQS wager message contract", () => {
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        idempotencyKey: " ",
+        data: { ...validMessage.data, idempotencyKey: " " },
       }),
     ).toThrow(InvalidWagerTransactionMessageError);
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: {
-          ...validMessage.transaction,
+        data: {
+          ...validMessage.data,
           playerId: "not-a-uuid",
         },
       }),
@@ -111,8 +142,8 @@ describe("SQS wager message contract", () => {
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: {
-          ...validMessage.transaction,
+        data: {
+          ...validMessage.data,
           money: { amount: "1e2", currency: "BRL" },
         },
       }),
@@ -120,8 +151,8 @@ describe("SQS wager message contract", () => {
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: {
-          ...validMessage.transaction,
+        data: {
+          ...validMessage.data,
           walletId: "not-a-uuid",
         },
       }),
@@ -129,24 +160,18 @@ describe("SQS wager message contract", () => {
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: {
-          ...validMessage.transaction,
+        data: {
+          ...validMessage.data,
           money: { amount: "25.00", currency: "ZZZ" },
         },
       }),
     ).toThrow(InvalidWagerTransactionMessageError);
-    expect(() =>
-      parseWagerTransactionMessage({
-        ...validMessage,
-        correlationId: " ",
-      }),
-    ).toThrow(InvalidWagerTransactionMessageError);
     const { gameId: _gameId, ...missingRequiredField } =
-      validMessage.transaction;
+      validMessage.data;
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
-        transaction: missingRequiredField,
+        data: missingRequiredField,
       }),
     ).toThrow(InvalidWagerTransactionMessageError);
   });
