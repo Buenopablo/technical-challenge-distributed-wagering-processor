@@ -420,15 +420,15 @@ entram no hash.
 
 Comportamentos HTTP implementados:
 
-| HTTP | Situação |
-| --- | --- |
-| `200` | Processamento bem-sucedido ou replay de operação processada. |
-| `202` | Reversão persistida como `PENDING_REFERENCE`, aguardando referência. |
+| HTTP  | Situação                                                                                                                             |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `200` | Processamento bem-sucedido ou replay de operação processada.                                                                         |
+| `202` | Reversão persistida como `PENDING_REFERENCE`, aguardando referência.                                                                 |
 | `400` | Header ausente, payload inválido, moeda/valor inválido, campos obrigatórios de referência ausentes ou tentativa de enviar `OPENING`. |
-| `404` | Carteira inexistente. |
-| `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente ou `externalTransactionId` já usado pelo provider. |
-| `422` | Rejeição de negócio. O corpo inclui `transactionId`, `status`, `balance`, `idempotentReplay` e `failureCode`. |
-| `500` | Falha inesperada de infraestrutura; a transação SQL é revertida. |
+| `404` | Carteira inexistente.                                                                                                                |
+| `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente ou `externalTransactionId` já usado pelo provider.                         |
+| `422` | Rejeição de negócio. O corpo inclui `transactionId`, `status`, `balance`, `idempotentReplay` e `failureCode`.                        |
+| `500` | Falha inesperada de infraestrutura; a transação SQL é revertida.                                                                     |
 
 O README oficial deixa o mapeamento HTTP a cargo do candidato. Para `409`,
 `400` e `404`, a resposta usa o formato padrão de exceção do NestJS.
