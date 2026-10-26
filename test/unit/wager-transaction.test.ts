@@ -75,6 +75,40 @@ describe("external wager transactions", () => {
     ).toThrow(InvalidWagerTransactionStateError);
   });
 
+  test("requires and resolves references before processing a reversal", () => {
+    const props = {
+      id: randomUUID(),
+      providerId: "provider-a",
+      externalTransactionId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      payloadHash: "a".repeat(64),
+      walletId: randomUUID(),
+      playerId: randomUUID(),
+      roundId: "round-1",
+      gameId: "game-1",
+      kind: WagerTransactionKind.Refund,
+      money: Money.from({ amount: "80.00", currency: "BRL" }),
+      createdAt: at,
+    };
+
+    expect(() => WagerTransaction.createExternal(props)).toThrow(
+      /requires referenceExternalTransactionId/,
+    );
+
+    const reversal = WagerTransaction.createExternal({
+      ...props,
+      referenceExternalTransactionId: "external-bet-1",
+    });
+    reversal.markPendingReference();
+    expect(reversal.status).toBe(WagerTransactionStatus.PendingReference);
+    reversal.markProcessed(at, "internal-bet-1");
+    expect(reversal.status).toBe(WagerTransactionStatus.Processed);
+    expect(reversal.referenceTransactionId).toBe("internal-bet-1");
+    expect(() => reversal.setReferenceTransactionId("another-reference")).toThrow(
+      InvalidWagerTransactionStateError,
+    );
+  });
+
   test("persists business rejection as a terminal state with a failure code", () => {
     const transaction = createTransaction(WagerTransactionKind.Bet);
     transaction.reject("INSUFFICIENT_FUNDS");

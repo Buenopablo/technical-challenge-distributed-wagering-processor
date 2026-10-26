@@ -78,6 +78,16 @@ export class WagerTransactionEntity {
   @Column({ name: "failure_code", type: "varchar", length: 64, nullable: true })
   failureCode!: string | null;
 
+  @Column({ name: "reference_attempts", type: "integer", default: 0 })
+  referenceAttempts!: number;
+
+  @Column({
+    name: "reference_next_attempt_at",
+    type: "timestamptz",
+    nullable: true,
+  })
+  referenceNextAttemptAt!: Date | null;
+
   @Column({
     name: "result_balance",
     type: "numeric",

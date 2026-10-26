@@ -8,7 +8,8 @@ import {
 
 type WagerEventResult =
   | { status: "PROCESSED" }
-  | { status: "REJECTED"; failureCode: string };
+  | { status: "REJECTED"; failureCode: string }
+  | { status: "PENDING_REFERENCE" };
 
 export interface CreateWagerIntegrationEventsInput {
   transactionId: string;
@@ -19,6 +20,7 @@ export interface CreateWagerIntegrationEventsInput {
   roundId: string;
   gameId: string;
   kind: WagerMessageKind;
+  referenceExternalTransactionId?: string;
   money: MoneyProps;
   resultBalance: MoneyProps;
   previousBalance?: MoneyProps;
@@ -45,24 +47,37 @@ export function createWagerIntegrationEvents(
     kind: input.kind,
     money: input.money,
     resultBalance: input.resultBalance,
+    ...(input.referenceExternalTransactionId
+      ? {
+          referenceExternalTransactionId:
+            input.referenceExternalTransactionId,
+        }
+      : {}),
   };
   const candidates: unknown[] = [
-    input.result.status === "PROCESSED"
+    input.result.status === "PENDING_REFERENCE"
       ? {
           ...envelope,
           eventId: randomUUID(),
-          eventType: "WagerTransactionProcessed",
+          eventType: "WagerTransactionPendingReference",
           payload: transactionPayload,
         }
-      : {
-          ...envelope,
-          eventId: randomUUID(),
-          eventType: "WagerTransactionRejected",
-          payload: {
-            ...transactionPayload,
-            failureCode: input.result.failureCode,
+      : input.result.status === "PROCESSED"
+        ? {
+            ...envelope,
+            eventId: randomUUID(),
+            eventType: "WagerTransactionProcessed",
+            payload: transactionPayload,
+          }
+        : {
+            ...envelope,
+            eventId: randomUUID(),
+            eventType: "WagerTransactionRejected",
+            payload: {
+              ...transactionPayload,
+              failureCode: input.result.failureCode,
+            },
           },
-        },
   ];
 
   if (input.previousBalance) {

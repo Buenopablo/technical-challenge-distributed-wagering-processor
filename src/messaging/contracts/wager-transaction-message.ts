@@ -5,7 +5,12 @@ import {
 } from "../../domain/money/money";
 
 export const WAGER_TRANSACTION_REQUESTED_TYPE = "WagerTransactionRequested";
-export type WagerMessageKind = "BET" | "WIN" | "LOSS";
+export type WagerMessageKind =
+  | "BET"
+  | "WIN"
+  | "LOSS"
+  | "REFUND"
+  | "ROLLBACK";
 
 export interface WagerTransactionMessage {
   messageId: string;
@@ -21,6 +26,7 @@ export interface WagerTransactionMessage {
     gameId: string;
     kind: WagerMessageKind;
     money: MoneyProps;
+    referenceExternalTransactionId?: string;
   };
 }
 
@@ -136,6 +142,7 @@ export function parseWagerTransactionMessage(
       "gameId",
       "kind",
       "money",
+      "referenceExternalTransactionId",
     ],
     "data",
   );
@@ -161,9 +168,36 @@ export function parseWagerTransactionMessage(
   }
 
   const kind = data.kind;
-  if (kind !== "BET" && kind !== "WIN" && kind !== "LOSS") {
+  if (
+    kind !== "BET" &&
+    kind !== "WIN" &&
+    kind !== "LOSS" &&
+    kind !== "REFUND" &&
+    kind !== "ROLLBACK"
+  ) {
     throw new InvalidWagerTransactionMessageError(
-      "kind must be BET, WIN, or LOSS in this processing stage",
+      "kind must be BET, WIN, LOSS, REFUND, or ROLLBACK",
+    );
+  }
+  const referenceExternalTransactionId =
+    data.referenceExternalTransactionId === undefined
+      ? undefined
+      : requiredString(data, "referenceExternalTransactionId", 255);
+  if (
+    (kind === "REFUND" || kind === "ROLLBACK") &&
+    referenceExternalTransactionId === undefined
+  ) {
+    throw new InvalidWagerTransactionMessageError(
+      `${kind} requires referenceExternalTransactionId`,
+    );
+  }
+  if (
+    kind !== "REFUND" &&
+    kind !== "ROLLBACK" &&
+    referenceExternalTransactionId !== undefined
+  ) {
+    throw new InvalidWagerTransactionMessageError(
+      "referenceExternalTransactionId is only valid for REFUND or ROLLBACK",
     );
   }
   if (!isRecord(data.money)) {
@@ -204,6 +238,9 @@ export function parseWagerTransactionMessage(
       gameId,
       kind,
       money,
+      ...(referenceExternalTransactionId
+        ? { referenceExternalTransactionId }
+        : {}),
     },
   };
 }

@@ -10,6 +10,7 @@
     "start:dev": "bun --watch src/main.ts",
     "outbox:publish": "bun run src/outbox-publisher.ts",
     "inbox:consume": "bun run src/inbox-consumer.ts",
+    "references:process": "bun run src/pending-reference-worker.ts",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "db:migrate": "bun run src/database/run-migrations.ts",

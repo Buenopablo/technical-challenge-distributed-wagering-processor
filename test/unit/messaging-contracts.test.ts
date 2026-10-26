@@ -8,6 +8,7 @@ import {
   InvalidIntegrationEventError,
   parseWagerIntegrationEvent,
   WalletBalanceChangedEvent,
+  WagerTransactionPendingReferenceEvent,
   WagerTransactionProcessedEvent,
   WagerTransactionRejectedEvent,
 } from "../../src/messaging/contracts/integration-event";
@@ -61,6 +62,17 @@ const rejectedEvent = {
   },
 } satisfies WagerTransactionRejectedEvent;
 
+const pendingReferenceEvent = {
+  ...processedEvent,
+  eventId: "0192f298-345e-7e38-af88-e43f851a81a0",
+  eventType: "WagerTransactionPendingReference",
+  payload: {
+    ...processedEvent.payload,
+    kind: "REFUND",
+    referenceExternalTransactionId: "transaction-123",
+  },
+} satisfies WagerTransactionPendingReferenceEvent;
+
 const balanceChangedEvent = {
   eventId: "0192f298-345e-7e38-af88-e43f851a819f",
   eventType: "WalletBalanceChanged",
@@ -85,6 +97,22 @@ describe("SQS wager message contract", () => {
     expect(() =>
       parseWagerTransactionMessage({ ...validMessage, type: "Unknown" }),
     ).toThrow(InvalidWagerTransactionMessageError);
+    expect(
+      parseWagerTransactionMessage({
+        ...validMessage,
+        data: {
+          ...validMessage.data,
+          kind: "REFUND",
+          referenceExternalTransactionId: "reference-123",
+        },
+      }).data.kind,
+    ).toBe("REFUND");
+    expect(() =>
+      parseWagerTransactionMessage({
+        ...validMessage,
+        data: { ...validMessage.data, kind: "ROLLBACK" },
+      }),
+    ).toThrow(/requires referenceExternalTransactionId/);
     expect(() =>
       parseWagerTransactionMessage({
         ...validMessage,
@@ -180,6 +208,7 @@ describe("SQS wager message contract", () => {
     for (const event of [
       processedEvent,
       rejectedEvent,
+      pendingReferenceEvent,
       balanceChangedEvent,
     ]) {
       const serialized = JSON.stringify(event);

@@ -2,16 +2,17 @@
 
 Backend em desenvolvimento para o desafio Distributed Wagering Processor da
 Jungle Gaming. Além da fundação NestJS/TypeORM e da abertura de carteiras, o
-projeto implementa `POST /wagering/transactions` para `BET`, `WIN` e `LOSS`,
-Inbox/Outbox persistentes, um consumidor da fila financeira de entrada e um
-publisher independente dos eventos de integração de saída.
+projeto implementa `POST /wagering/transactions` para `BET`, `WIN`, `LOSS`,
+`REFUND` e `ROLLBACK`, Inbox/Outbox persistentes, um consumidor da fila
+financeira de entrada e um publisher independente dos eventos de integração
+de saída.
 
-Este projeto ainda não conclui o desafio. As operações BET/WIN/LOSS/REFUND/
-ROLLBACK não estão todas implementadas: `REFUND` e `ROLLBACK` continuam
-pendentes. Também faltam os endpoints de consulta, processamento operacional
-da DLQ, reconciliação e observabilidade. As requisições financeiras SQS usam
-o mesmo caso de uso HTTP, com Inbox, efeitos financeiros, ledger e Outbox na
-mesma transação PostgreSQL.
+Este projeto ainda não conclui o desafio. Referências ausentes são persistidas
+como `PENDING_REFERENCE` e reprocessadas por um worker agendado. Também faltam
+os endpoints de consulta, processamento operacional da DLQ, reconciliação e
+observabilidade.
+As requisições financeiras SQS usam o mesmo caso de uso HTTP, com Inbox,
+efeitos financeiros, ledger e Outbox na mesma transação PostgreSQL.
 
 ## Pré-requisitos
 
@@ -69,11 +70,11 @@ envelope `WagerTransactionRequested`, além de exigir processamento seguro sob
 duplicatas e falhas. A mensagem de entrada contém `messageId`, `type`,
 `occurredAt` e `data`, com `providerId`, `externalTransactionId`,
 `idempotencyKey`, `playerId`, `walletId`, `roundId`, `gameId`, `kind` e
-`money`. `BET`, `WIN` e `LOSS` são aceitos nesta etapa; `OPENING` é interno, e
-`REFUND`/`ROLLBACK` ainda não são processados. Valores monetários são strings
-decimais validadas por `Money`; `playerId` e `walletId` são UUIDs. A Inbox usa
-o `MessageId` do transporte SQS junto ao `consumerName`, enquanto a
-idempotência financeira usa a `idempotencyKey` e o hash do payload de negócio.
+`money`. `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` são aceitos; `OPENING` é
+interno. Reversões exigem `referenceExternalTransactionId`. Valores monetários
+são strings decimais validadas por `Money`; `playerId` e `walletId` são UUIDs.
+A Inbox usa o `MessageId` do transporte SQS junto ao `consumerName`, enquanto
+a idempotência financeira usa a `idempotencyKey` e o hash do payload de negócio.
 
 Os eventos de saída usam envelope versionado (`eventVersion: 1`) com `eventId`
 estável persistido na Outbox junto ao evento,
@@ -86,11 +87,14 @@ são:
   `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`,
   `kind`, `money` e `resultBalance`.
 - `WagerTransactionRejected`: mesmos campos, mais `failureCode`.
+- `WagerTransactionPendingReference`: mesmos identificadores e valores da
+  transação, mais `referenceExternalTransactionId`, quando a referência ainda
+  não existe.
 - `WalletBalanceChanged`: `transactionId`, `walletId`, `playerId`,
   `previousBalance` e `balance`.
 
 Valores monetários no payload permanecem strings decimais. A mensagem de
-entrada e os três tipos de evento de saída possuem validadores runtime e
+entrada e os quatro tipos de evento de saída possuem validadores runtime e
 testes unitários de serialização; os eventos também verificam UUIDs,
 timestamp UTC válido, consistência de moeda e relação entre agregado e wallet.
 Em `WagerTransactionRejected`, a moeda de `money` pode diferir da moeda de
@@ -138,6 +142,16 @@ transação financeira. A migration aditiva `AddOutboxFailureState` adiciona
 bloqueia a tabela e aborta antes de remover colunas se houver diagnóstico de
 falha persistido. Claims expirados e eventos terminais são cobertos por testes
 de integração em PostgreSQL temporário.
+`AddWagerReferenceUniqueness` acrescenta unicidade por
+`(provider_id, external_transaction_id)` para resolver referências sem
+ambiguidade e uma constraint única parcial por
+`(reference_transaction_id, kind)` para impedir reversões processadas
+duplicadas do mesmo tipo. A migration valida dados preexistentes e falha sem
+apagá-los se encontrar identidades ambíguas ou reversões duplicadas.
+`AddPendingReferenceRetry` adiciona o contador e o próximo instante de
+tentativa, agenda pendências preexistentes para reprocessamento e cria um
+índice parcial para a busca das pendências vencidas. Sua reversão recusa
+remover o estado de retry enquanto houver transações `PENDING_REFERENCE`.
 
 Cada nova transação financeira processada grava `WagerTransactionProcessed`,
 inclusive `LOSS`; uma rejeição de negócio persistida grava
@@ -280,6 +294,7 @@ bun run start            # inicia a aplicação
 bun run start:dev        # inicia com Bun watch
 bun run outbox:publish   # inicia apenas o publisher da Outbox
 bun run inbox:consume    # inicia apenas o consumidor financeiro da fila SQS
+bun run references:process # inicia apenas o worker de referências pendentes
 ```
 
 Os testes de integração conectam-se ao PostgreSQL configurado, criam um banco
@@ -354,6 +369,32 @@ Tipos implementados:
   código `INSUFFICIENT_FUNDS`, sem alterar saldo ou criar ledger.
 - `WIN`: credita o valor.
 - `LOSS`: registra a transação sem alterar saldo ou criar ledger.
+- `REFUND`: credita uma `BET` processada uma única vez.
+- `ROLLBACK`: aplica o efeito inverso de uma `BET`, `WIN` ou `REFUND`
+  processada, uma vez por tipo de reversão.
+
+As reversões exigem referência resolvida por `(providerId,
+externalTransactionId)` e validam tipo permitido, player, wallet, moeda,
+rodada e igualdade integral do valor. Referência ausente é persistida como
+`PENDING_REFERENCE`, sem efeito no saldo/ledger, com snapshot para replay e
+evento `WagerTransactionPendingReference`; a API responde `202`. A repetição
+da mesma chave e payload retorna o mesmo status e snapshot com
+`idempotentReplay: true`. `bun run references:process` inicia o worker
+independente que busca pendências elegíveis e tenta resolver a referência.
+Pendências seguem uma política de até oito tentativas ou 24 horas desde a
+criação, o que ocorrer primeiro. A primeira tentativa ocorre após 5 segundos;
+referências ausentes são reagendadas com backoff exponencial iniciado em
+5 segundos e limitado a 1 hora. Oito tentativas sem referência ou a expiração
+do TTL finalizam a transação como `REJECTED`, com `REFERENCE_NOT_FOUND` e
+`WagerTransactionRejected`. A finalização, carteira, ledger e Outbox são
+gravados atomicamente; a expiração prevalece mesmo se a referência surgir após
+o TTL. O worker deve ser iniciado depois de aplicar as migrations.
+
+Falhas de reversão que deixariam o saldo negativo são rejeitadas como
+`REVERSAL_WOULD_NEGATIVE_BALANCE`, distinto de `INSUFFICIENT_FUNDS`. Os códigos
+de referência incluem `REFERENCE_KIND_NOT_ALLOWED`,
+`REFERENCE_NOT_PROCESSED`, `REFERENCE_INCOMPATIBLE`,
+`REFERENCE_AMOUNT_MISMATCH` e `REFERENCE_ALREADY_REVERSED`.
 
 O README oficial não define se valores zero devem ser aceitos para essas
 operações. A implementação permite `0.00`: a transação é registrada como
@@ -382,22 +423,20 @@ Comportamentos HTTP implementados:
 | HTTP | Situação |
 | --- | --- |
 | `200` | Processamento bem-sucedido ou replay de operação processada. |
+| `202` | Reversão persistida como `PENDING_REFERENCE`, aguardando referência. |
 | `400` | Header ausente, payload inválido, moeda/valor inválido, campos obrigatórios de referência ausentes ou tentativa de enviar `OPENING`. |
 | `404` | Carteira inexistente. |
-| `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente. |
+| `409` | Mesma `Idempotency-Key` com conteúdo de negócio diferente ou `externalTransactionId` já usado pelo provider. |
 | `422` | Rejeição de negócio. O corpo inclui `transactionId`, `status`, `balance`, `idempotentReplay` e `failureCode`. |
-| `501` | Payload válido de `REFUND` ou `ROLLBACK`, reconhecido pelo desafio, mas ainda não implementado nesta etapa. Essas operações exigem `referenceExternalTransactionId`; payload malformado retorna `400`. |
 | `500` | Falha inesperada de infraestrutura; a transação SQL é revertida. |
 
 O README oficial deixa o mapeamento HTTP a cargo do candidato. Para `409`,
-`400`, `404` e `501`, a resposta usa o formato padrão de exceção do NestJS.
+`400` e `404`, a resposta usa o formato padrão de exceção do NestJS.
 Falhas de negócio são persistidas e podem ser repetidas com replay do mesmo
 resultado; falhas inesperadas não deixam uma transação parcial persistida.
 
 ## Limitações e próximos passos
 
-- Estão implementados `OPENING`, `BET`, `WIN` e `LOSS`; `REFUND` e `ROLLBACK`
-  ainda não têm fluxo financeiro.
 - Ainda não há endpoints para criar ou consultar carteiras, transações,
   ledger ou reconciliação.
 - A idempotência persistente, o bloqueio por carteira e o processamento

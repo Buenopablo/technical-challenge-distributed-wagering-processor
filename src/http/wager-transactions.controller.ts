@@ -7,12 +7,12 @@ import {
   HttpCode,
   HttpException,
   HttpStatus,
-  NotImplementedException,
   NotFoundException,
   Post,
 } from "@nestjs/common";
 import {
   IdempotencyConflictError,
+  ExternalTransactionConflictError,
   ProcessWagerTransactionInput,
   ProcessWagerTransactionResult,
   ProcessWagerTransactionUseCase,
@@ -111,13 +111,24 @@ function parseRequest(
   }
   validateMoney(amount, currency);
 
+  const referenceExternalTransactionId =
+    kind === WagerTransactionKind.Refund ||
+    kind === WagerTransactionKind.Rollback
+      ? requiredString(body, "referenceExternalTransactionId", 255)
+      : undefined;
+
   if (
     kind === WagerTransactionKind.Refund ||
     kind === WagerTransactionKind.Rollback
   ) {
-    requiredString(body, "referenceExternalTransactionId", 255);
-    throw new NotImplementedException(
-      `${kind} is part of the challenge contract but is not implemented yet`,
+    if (!referenceExternalTransactionId) {
+      throw new BadRequestException(
+        `${kind} requires referenceExternalTransactionId`,
+      );
+    }
+  } else if (body.referenceExternalTransactionId !== undefined) {
+    throw new BadRequestException(
+      "referenceExternalTransactionId is only valid for REFUND or ROLLBACK",
     );
   }
 
@@ -131,6 +142,9 @@ function parseRequest(
     gameId,
     kind,
     money: { amount, currency },
+    ...(referenceExternalTransactionId
+      ? { referenceExternalTransactionId }
+      : {}),
   };
 }
 
@@ -158,6 +172,9 @@ export class WagerTransactionsController {
       if (error instanceof IdempotencyConflictError) {
         throw new ConflictException(error.message);
       }
+      if (error instanceof ExternalTransactionConflictError) {
+        throw new ConflictException(error.message);
+      }
       if (error instanceof WagerWalletNotFoundError) {
         throw new NotFoundException(error.message);
       }
@@ -177,11 +194,15 @@ export class WagerTransactionsController {
       );
     }
 
-    return {
+    const response = {
       transactionId: result.transactionId,
       status: result.status,
       balance: result.balance,
       idempotentReplay: result.idempotentReplay,
     };
+    if (result.status === WagerTransactionStatus.PendingReference) {
+      throw new HttpException(response, HttpStatus.ACCEPTED);
+    }
+    return response;
   }
 }

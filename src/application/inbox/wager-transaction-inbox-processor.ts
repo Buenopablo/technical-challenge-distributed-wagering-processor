@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { DataSource, EntityManager } from "typeorm";
 import {
   IdempotencyConflictError,
+  ExternalTransactionConflictError,
   ProcessWagerTransactionInput,
   ProcessWagerTransactionResult,
   ProcessWagerTransactionUseCase,
@@ -93,8 +94,18 @@ function toUseCaseInput(
         ? WagerTransactionKind.Bet
         : message.data.kind === "WIN"
           ? WagerTransactionKind.Win
-          : WagerTransactionKind.Loss,
+          : message.data.kind === "LOSS"
+            ? WagerTransactionKind.Loss
+            : message.data.kind === "REFUND"
+              ? WagerTransactionKind.Refund
+              : WagerTransactionKind.Rollback,
     money: message.data.money,
+    ...(message.data.referenceExternalTransactionId
+      ? {
+          referenceExternalTransactionId:
+            message.data.referenceExternalTransactionId,
+        }
+      : {}),
   };
 }
 
@@ -175,7 +186,10 @@ export class WagerTransactionInboxProcessor {
         manager,
       );
     } catch (error) {
-      if (error instanceof IdempotencyConflictError) {
+      if (
+        error instanceof IdempotencyConflictError ||
+        error instanceof ExternalTransactionConflictError
+      ) {
         return {
           messageId: transportMessageId,
           duplicate: false,

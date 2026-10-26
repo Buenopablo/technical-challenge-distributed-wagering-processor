@@ -34,6 +34,7 @@ export type WagerTransactionProcessedEvent = IntegrationEventEnvelope<
     kind: WagerMessageKind;
     money: MoneyProps;
     resultBalance: MoneyProps;
+    referenceExternalTransactionId?: string;
   }
 >;
 
@@ -51,6 +52,24 @@ export type WagerTransactionRejectedEvent = IntegrationEventEnvelope<
     money: MoneyProps;
     resultBalance: MoneyProps;
     failureCode: string;
+    referenceExternalTransactionId?: string;
+  }
+>;
+
+export type WagerTransactionPendingReferenceEvent = IntegrationEventEnvelope<
+  "WagerTransactionPendingReference",
+  {
+    transactionId: string;
+    providerId: string;
+    externalTransactionId: string;
+    playerId: string;
+    walletId: string;
+    roundId: string;
+    gameId: string;
+    kind: "REFUND" | "ROLLBACK";
+    money: MoneyProps;
+    resultBalance: MoneyProps;
+    referenceExternalTransactionId: string;
   }
 >;
 
@@ -68,6 +87,7 @@ export type WalletBalanceChangedEvent = IntegrationEventEnvelope<
 export type WagerIntegrationEvent =
   | WagerTransactionProcessedEvent
   | WagerTransactionRejectedEvent
+  | WagerTransactionPendingReferenceEvent
   | WalletBalanceChangedEvent;
 
 export class InvalidIntegrationEventError extends Error {
@@ -150,10 +170,37 @@ function requiredMoney(value: JsonRecord, field: string): MoneyProps {
 }
 
 function requiredKind(value: JsonRecord): WagerMessageKind {
-  if (value.kind === "BET" || value.kind === "WIN" || value.kind === "LOSS") {
+  if (
+    value.kind === "BET" ||
+    value.kind === "WIN" ||
+    value.kind === "LOSS" ||
+    value.kind === "REFUND" ||
+    value.kind === "ROLLBACK"
+  ) {
     return value.kind;
   }
-  return invalid("payload.kind must be BET, WIN, or LOSS");
+  return invalid("payload.kind must be BET, WIN, LOSS, REFUND, or ROLLBACK");
+}
+
+function optionalReference(value: JsonRecord): string | undefined {
+  return optionalString(value, "referenceExternalTransactionId");
+}
+
+function referenceForKind(
+  value: JsonRecord,
+  kind: WagerMessageKind,
+): string | undefined {
+  const reference = optionalReference(value);
+  const requiresReference = kind === "REFUND" || kind === "ROLLBACK";
+  if (requiresReference && !reference) {
+    return invalid(`${kind} event requires referenceExternalTransactionId`);
+  }
+  if (!requiresReference && reference) {
+    return invalid(
+      "referenceExternalTransactionId is only valid for REFUND or ROLLBACK",
+    );
+  }
+  return reference;
 }
 
 function requiredUtcTimestamp(value: unknown): string {
@@ -254,6 +301,8 @@ export function parseWagerIntegrationEvent(
     if (money.currency !== resultBalance.currency) {
       return invalid("money and resultBalance currencies must match");
     }
+    const kind = requiredKind(payload);
+    const referenceExternalTransactionId = referenceForKind(payload, kind);
 
     return {
       ...envelope,
@@ -271,9 +320,12 @@ export function parseWagerIntegrationEvent(
         walletId,
         roundId: requiredString(payload, "roundId", 255),
         gameId: requiredString(payload, "gameId", 255),
-        kind: requiredKind(payload),
+        kind,
         money,
         resultBalance,
+        ...(referenceExternalTransactionId
+          ? { referenceExternalTransactionId }
+          : {}),
       },
     };
   }
@@ -284,6 +336,8 @@ export function parseWagerIntegrationEvent(
     const walletId = requiredUuid(payload, "walletId");
     const money = requiredMoney(payload, "money");
     const resultBalance = requiredMoney(payload, "resultBalance");
+    const kind = requiredKind(payload);
+    const referenceExternalTransactionId = referenceForKind(payload, kind);
     validateWagerAggregate(envelope.aggregateId, walletId);
 
     return {
@@ -302,10 +356,57 @@ export function parseWagerIntegrationEvent(
         walletId,
         roundId: requiredString(payload, "roundId", 255),
         gameId: requiredString(payload, "gameId", 255),
-        kind: requiredKind(payload),
+        kind,
         money,
         resultBalance,
         failureCode: requiredString(payload, "failureCode", 64),
+        ...(referenceExternalTransactionId
+          ? { referenceExternalTransactionId }
+          : {}),
+      },
+    };
+  }
+
+  if (input.eventType === "WagerTransactionPendingReference") {
+    const envelope = requiredEnvelope(
+      input,
+      "WagerTransactionPendingReference",
+    );
+    const payload = requiredPayload(input);
+    const walletId = requiredUuid(payload, "walletId");
+    const kind = requiredKind(payload);
+    if (kind !== "REFUND" && kind !== "ROLLBACK") {
+      return invalid(
+        "WagerTransactionPendingReference kind must be REFUND or ROLLBACK",
+      );
+    }
+    const money = requiredMoney(payload, "money");
+    const resultBalance = requiredMoney(payload, "resultBalance");
+    validateWagerAggregate(envelope.aggregateId, walletId);
+    return {
+      ...envelope,
+      eventType: "WagerTransactionPendingReference",
+      eventVersion: INTEGRATION_EVENT_VERSION,
+      payload: {
+        transactionId: requiredUuid(payload, "transactionId"),
+        providerId: requiredString(payload, "providerId", 128),
+        externalTransactionId: requiredString(
+          payload,
+          "externalTransactionId",
+          255,
+        ),
+        playerId: requiredUuid(payload, "playerId"),
+        walletId,
+        roundId: requiredString(payload, "roundId", 255),
+        gameId: requiredString(payload, "gameId", 255),
+        kind,
+        money,
+        resultBalance,
+        referenceExternalTransactionId: requiredString(
+          payload,
+          "referenceExternalTransactionId",
+          255,
+        ),
       },
     };
   }

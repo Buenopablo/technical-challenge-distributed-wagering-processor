@@ -39,6 +39,7 @@ export interface CreateExternalWagerTransactionProps {
   gameId: string;
   kind: WagerTransactionKind;
   money: Money;
+  referenceExternalTransactionId?: string | null;
   createdAt: Date;
 }
 
@@ -73,6 +74,7 @@ export class WagerTransaction {
   private _status: WagerTransactionStatus;
   private _processedAt: Date | undefined;
   private _failureCode: string | undefined;
+  private _referenceTransactionId: string | null;
 
   private constructor(
     public readonly id: string,
@@ -87,7 +89,7 @@ export class WagerTransaction {
     public readonly kind: WagerTransactionKind,
     public readonly money: Money,
     public readonly referenceExternalTransactionId: string | null,
-    public readonly referenceTransactionId: string | null,
+    referenceTransactionId: string | null,
     public readonly createdAt: Date,
     status: WagerTransactionStatus,
     processedAt: Date | undefined,
@@ -96,6 +98,7 @@ export class WagerTransaction {
     this._status = status;
     this._processedAt = processedAt ? new Date(processedAt) : undefined;
     this._failureCode = failureCode;
+    this._referenceTransactionId = referenceTransactionId;
   }
 
   static createOpening(props: CreateOpeningTransactionProps): WagerTransaction {
@@ -134,6 +137,23 @@ export class WagerTransaction {
         "OPENING transactions can only be created internally",
       );
     }
+    const reversal =
+      props.kind === WagerTransactionKind.Refund ||
+      props.kind === WagerTransactionKind.Rollback;
+    if (reversal && !props.referenceExternalTransactionId?.trim()) {
+      throw new InvalidWagerTransactionStateError(
+        `${props.kind} requires referenceExternalTransactionId`,
+      );
+    }
+    if (
+      !reversal &&
+      props.referenceExternalTransactionId !== undefined &&
+      props.referenceExternalTransactionId !== null
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        "Only REFUND and ROLLBACK can reference another transaction",
+      );
+    }
 
     return new WagerTransaction(
       props.id,
@@ -147,7 +167,7 @@ export class WagerTransaction {
       props.gameId,
       props.kind,
       props.money,
-      null,
+      props.referenceExternalTransactionId ?? null,
       null,
       props.createdAt,
       WagerTransactionStatus.Pending,
@@ -182,6 +202,10 @@ export class WagerTransaction {
     return this._status;
   }
 
+  get referenceTransactionId(): string | null {
+    return this._referenceTransactionId;
+  }
+
   get processedAt(): Date | undefined {
     return this._processedAt ? new Date(this._processedAt) : undefined;
   }
@@ -190,19 +214,93 @@ export class WagerTransaction {
     return this._failureCode;
   }
 
-  markProcessed(at: Date): void {
-    if (this._status !== WagerTransactionStatus.Pending) {
+  markProcessed(at: Date, referenceTransactionId?: string): void {
+    if (
+      this._status !== WagerTransactionStatus.Pending &&
+      this._status !== WagerTransactionStatus.PendingReference
+    ) {
       throw new InvalidWagerTransactionStateError(
         `Cannot process a transaction in state ${this._status}`,
       );
     }
 
+    if (
+      (this.kind === WagerTransactionKind.Refund ||
+        this.kind === WagerTransactionKind.Rollback) &&
+      !referenceTransactionId &&
+      !this._referenceTransactionId
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        `${this.kind} cannot be processed without a resolved reference`,
+      );
+    }
+    if (referenceTransactionId) {
+      this.setReferenceTransactionId(referenceTransactionId);
+    }
     this._status = WagerTransactionStatus.Processed;
     this._processedAt = new Date(at);
   }
 
-  reject(failureCode: string): void {
+  markPendingReference(): void {
     if (this._status !== WagerTransactionStatus.Pending) {
+      throw new InvalidWagerTransactionStateError(
+        `Cannot defer a transaction in state ${this._status}`,
+      );
+    }
+    if (
+      this.kind !== WagerTransactionKind.Refund &&
+      this.kind !== WagerTransactionKind.Rollback
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        "Only REFUND and ROLLBACK can have a pending reference",
+      );
+    }
+    if (!this.referenceExternalTransactionId) {
+      throw new InvalidWagerTransactionStateError(
+        "A pending reference transaction must identify its external reference",
+      );
+    }
+    this._status = WagerTransactionStatus.PendingReference;
+  }
+
+  setReferenceTransactionId(referenceTransactionId: string): void {
+    if (
+      this._status !== WagerTransactionStatus.Pending &&
+      this._status !== WagerTransactionStatus.PendingReference
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        `Cannot change a reference in state ${this._status}`,
+      );
+    }
+    if (
+      this.kind !== WagerTransactionKind.Refund &&
+      this.kind !== WagerTransactionKind.Rollback
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        "Only REFUND and ROLLBACK can reference another transaction",
+      );
+    }
+    if (!referenceTransactionId.trim()) {
+      throw new InvalidWagerTransactionStateError(
+        "A reference transaction ID is required",
+      );
+    }
+    if (
+      this._referenceTransactionId &&
+      this._referenceTransactionId !== referenceTransactionId
+    ) {
+      throw new InvalidWagerTransactionStateError(
+        "The reference transaction cannot be changed",
+      );
+    }
+    this._referenceTransactionId = referenceTransactionId;
+  }
+
+  reject(failureCode: string): void {
+    if (
+      this._status !== WagerTransactionStatus.Pending &&
+      this._status !== WagerTransactionStatus.PendingReference
+    ) {
       throw new InvalidWagerTransactionStateError(
         `Cannot reject a transaction in state ${this._status}`,
       );
@@ -231,7 +329,7 @@ export class WagerTransaction {
       kind: this.kind,
       money: this.money.toJSON(),
       referenceExternalTransactionId: this.referenceExternalTransactionId,
-      referenceTransactionId: this.referenceTransactionId,
+      referenceTransactionId: this._referenceTransactionId,
       createdAt: new Date(this.createdAt),
       status: this._status,
       processedAt: this.processedAt ?? null,

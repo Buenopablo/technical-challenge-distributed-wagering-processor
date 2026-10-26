@@ -19,6 +19,7 @@ import {
 import { OpenWalletUseCase } from "../../src/application/wallets/open-wallet.use-case";
 import { ProcessWagerTransactionUseCase } from "../../src/application/wagering/process-wager-transaction.use-case";
 import { createDatabaseOptions } from "../../src/database/data-source";
+import { WagerTransactionKind } from "../../src/domain/wager-transaction/wager-transaction";
 import {
   createSqsConsumerClient,
   readSqsTransactionConsumerConfig,
@@ -58,22 +59,31 @@ function inputMessage(wallet: { id: string; playerId: string }, overrides: {
   idempotencyKey?: string;
   externalTransactionId?: string;
   amount?: string;
+  kind?: "BET" | "WIN" | "LOSS" | "REFUND" | "ROLLBACK";
+  referenceExternalTransactionId?: string;
 } = {}) {
+  const data = {
+    providerId: "integration-test",
+    externalTransactionId: overrides.externalTransactionId ?? randomUUID(),
+    idempotencyKey: overrides.idempotencyKey ?? randomUUID(),
+    playerId: wallet.playerId,
+    walletId: wallet.id,
+    roundId: "round-test",
+    gameId: "game-test",
+    kind: overrides.kind ?? "BET",
+    money: { amount: overrides.amount ?? "25.00", currency: "BRL" },
+    ...(overrides.referenceExternalTransactionId
+      ? {
+          referenceExternalTransactionId:
+            overrides.referenceExternalTransactionId,
+        }
+      : {}),
+  };
   return {
     messageId: `body-${randomUUID()}`,
     type: "WagerTransactionRequested",
     occurredAt: new Date().toISOString(),
-    data: {
-      providerId: "integration-test",
-      externalTransactionId: overrides.externalTransactionId ?? randomUUID(),
-      idempotencyKey: overrides.idempotencyKey ?? randomUUID(),
-      playerId: wallet.playerId,
-      walletId: wallet.id,
-      roundId: "round-test",
-      gameId: "game-test",
-      kind: "BET",
-      money: { amount: overrides.amount ?? "25.00", currency: "BRL" },
-    },
+    data,
   };
 }
 
@@ -373,6 +383,71 @@ describe("financial SQS consumer with temporary PostgreSQL and LocalStack resour
       [wallet.id],
     );
     expect(balance.balance).toBe("75.00");
+  });
+
+  test("processes REFUND from SQS through the shared financial use case", async () => {
+    const wallet = await createWallet();
+    const referenceExternalTransactionId = `reference-${randomUUID()}`;
+    await new ProcessWagerTransactionUseCase(database()).execute({
+      idempotencyKey: `seed-bet-${randomUUID()}`,
+      providerId: "integration-test",
+      externalTransactionId: referenceExternalTransactionId,
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: "round-test",
+      gameId: "game-test",
+      kind: WagerTransactionKind.Bet,
+      money: { amount: "25.00", currency: "BRL" },
+    });
+
+    const request = inputMessage(wallet, {
+      kind: "REFUND",
+      referenceExternalTransactionId,
+      amount: "25.00",
+    });
+    await sendMessage(request);
+    const received = await receiveMessage();
+    const client = new TrackingConsumerClient(consumerClient!);
+    client.onDelete = async () => {
+      expect(
+        await queryCount(
+          `SELECT count(*) FROM inbox_messages
+           WHERE consumer_name = $1 AND message_id = $2`,
+          ["wager-transaction-consumer", received.messageId],
+        ),
+      ).toBe(1);
+      expect(
+        await queryCount(
+          `SELECT count(*) FROM wager_transactions
+           WHERE external_transaction_id = $1
+             AND kind = 'REFUND' AND status = 'PROCESSED'`,
+          [request.data.externalTransactionId],
+        ),
+      ).toBe(1);
+      expect(
+        await queryCount(
+          `SELECT count(*) FROM wallet_ledger_entries
+           WHERE wallet_id = $1 AND direction = 'CREDIT'`,
+          [wallet.id],
+        ),
+      ).toBe(2);
+    };
+
+    await createConsumer(client).processReceivedMessage(received);
+    expect(client.deleteCount).toBe(1);
+    const [balance] = await database().query(
+      "SELECT balance FROM wallets WHERE id = $1",
+      [wallet.id],
+    );
+    expect(balance.balance).toBe("100.00");
+    expect(
+      await queryCount(
+        `SELECT count(*) FROM outbox_messages
+         WHERE payload ->> 'externalTransactionId' = $1
+           AND event_type = 'WagerTransactionProcessed'`,
+        [request.data.externalTransactionId],
+      ),
+    ).toBe(1);
   });
 
   test("keeps SQS MessageId identity separate from the financial idempotency key", async () => {
